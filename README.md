@@ -9,6 +9,7 @@
 1. Swin
 2. ConvNeXt
 3. YOLO
+4. ResNet
 
 ## Architectures and approaches
 
@@ -69,3 +70,4 @@ reducing latencies via asynchronous execution and pipelining"
 
 1. Можно начать с самого простого подхода: синхронного параллелизма данных на торче.
 2. Затем попробовать асинхронный, через tensorflow или Ray.
+3. Затем попоробовать распараллелить модель / пайплайн? 
