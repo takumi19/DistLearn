@@ -40,9 +40,9 @@ When to use:
 ## Frameworks
 
 Support DDP:
-- [PyTorch DistributedDataParallel, DDP]()
+- [PyTorch DistributedDataParallel, DDP](): simplest one, 
 - [PyTorch lightning]() supports various strategies;
-- [Horovod]() - handles node failures; supports PyTorch, TensorFlow, etc.; requires MPI setup
+- [Horovod](https://www.uber.com/blog/horovod/?uclick_id=3f23ceba-b1f1-4c15-9c0f-0f050e004128) - Primarily focuses on Data parallelism using efficient ring_allreduce and TensorFusion.
 - [TensorFlow Distributed Strategy]() - supports Asynchronous data parallelism with a parameter server strategy.
 
 Support model parallelism:
@@ -68,6 +68,9 @@ reducing latencies via asynchronous execution and pipelining"
 
 ## Plan
 
-1. Можно начать с самого простого подхода: синхронного параллелизма данных на торче.
-2. Затем попробовать асинхронный, через tensorflow или Ray.
-3. Затем попоробовать распараллелить модель / пайплайн? 
+1. Начать с синхронного параллелизма данных, он поддерживается Pytorch из коробки.
+2. Реализовать параллелизм модели, тоже на Pytorch.
+3. Улчушить предыдущее решение, использовав Pipeline параллелизм в стиле GPipe, поддерживается Pytorch из коробки.
+4. Использовать DeepSpeed, протестировать Zero redundancy optimizer по сравнению с предыдущими решениями.
+5. Попробовать реализовать гибридный подход (model + data parallelism) на deepspeed.
+6. Интегрировать RayTrain. Ray позволяет реагировать на упавшие ноды.
