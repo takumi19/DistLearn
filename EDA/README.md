@@ -135,7 +135,7 @@
 
 > В датасете отсутствуют пропуски, выбросы, классы сбалансированы, удобно работать, не требует очистки, и балансировки
 
-### Аугмекнтации
+### Аугментации
 
 Для CIFAR-10 (32×32, много фона, поз и освещения) нужны умеренные, но регуляризующие аугментации:
 
@@ -152,15 +152,130 @@
 > Датасет CIFAR-10 является сбалансированным, достаточно чистым и относительно простым для начального этапа экспериментов. Его небольшой размер и низкое разрешение позволяют быстро обучать и сравнивать модели, что особенно полезно для подбора архитектур и стратегий распределённого обучения. При этом в данных присутствует заметная вариативность фонов и поз, поэтому для улучшения обобщающей способности модели важны умеренные аугментации, направленные на инвариантность к сдвигам и освещению. Таким образом, CIFAR-10 хорошо подходит в качестве базового датасета для разработки и отладки моделей, прежде чем переходить к более сложным наборам, таким как CIFAR-100 и Tiny ImageNet.
 
 
-## CIFAR-10
+## CIFAR-100
 ### Общая информация
+
+Название датасета: CIFAR-100  
+Размер train датасета: 50,000  
+Размер test датасета: 10,000  
+Общий размер: 60,000  
+Количество классов: 100 (объединены в 20 суперклассов)  
+Форма изображений: torch.Size([3, 32, 32])  
+Тип данных: torch.float32  
+Диапазон значений: [0.000, 1.000]  
+Количество каналов: 3  
+Пример метки: e.g., 34 → fox
+
+> Изображения имеют размер 32×32, цветные (RGB), в формате uint8.   
+> Датасет сбалансирован: по 500 изображений на класс в train и 100 в test.  
+> По сравнению с CIFAR-10 отличается **высокой внутри-классовой вариативностью** и **малым числом примеров на класс**, что делает задачу сложнее и требует более сильных аугментаций и регуляризации.
+
 ### Баланс классов
+
+Train: 2 500 изображений на суперкласс (5%, по 1% на класс);
+Test: 1000 на суперкласс. Представлены не все классы. Представленные классы сбалансированы
+
+Полностью сбалансирован по классам и суперклассам.
+- Aquatic mammals (beaver, dolphin, otter, seal, whale)
+- Fish (aquarium_fish, flatfish, ray, shark, trout)
+- Flowers (orchid, poppy, rose, sunflower, tulip)
+- Food containers (bottle, bowl, can, cup, plate)
+- Fruit & vegetables (apple, mushroom, orange, pear, sweet_pepper)
+- Household electrical (clock, keyboard, lamp, telephone, television)
+- Household furniture (bed, chair, couch, table, wardrobe)
+- Insects (bee, beetle, butterfly, caterpillar, cockroach)
+- Large carnivores (bear, leopard, lion, tiger, wolf)
+- Large man-made outdoor (bridge, castle, house, road, skyscraper)
+- Large natural outdoor (cloud, forest, mountain, plain, sea)
+- Large omnivores & herbivores (camel, cattle, chimpanzee, elephant, kangaroo)
+- Medium-sized mammals (fox, porcupine, possum, raccoon, skunk)
+- Non-insect invertebrates (crab, lobster, snail, spider, worm)
+- People (baby, boy, girl, man, woman)
+- Reptiles (crocodile, dinosaur, lizard, snake, turtle)
+- Small mammals (hamster, mouse, rabbit, shrew, squirrel)
+- Trees (maple, oak, palm, pine, willow)
+- Vehicles 1 (bicycle, bus, motorcycle, pickup_truck, train)
+- Vehicles 2 (lawn_mower, rocket, streetcar, tank, tractor)
+
+> По сравнению с CIFAR-10 задача существенно сложнее из-за малого числа примеров на класс и тонких различий внутри суперклассов. 
 ### Пример данных
+### Пример данных
+![-](https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/sample_images.png)
+> На уровне суперклассов примеры визуально разделимы; внутри суперклассов различия тонкие, риск путаниц выше (напр., large carnivores, vehicle).
+> Объекты часто мелкие и на разнообразных фонах
+
 ### Усреднение изображений по классам
+
+Были сделаны усреднения изображений по классам, для выявления общей базы. 
+![](https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/all_average_images.png)
+
+> Усреднённые «прототипы» классов показывают характерные цветовые поля:  
+> Размытия меньше, чем в CIFAR-10 так как меньше усреднений
+
+> Прослеживается визуальная схожесть с классами, классы отдельные более различимы относительно CIFAR-10.
+
 ### Цветовой анализ
 #### Цветовые каналы
+![](https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/color_analysis.png)
+
+> Гистограммы более гладкие, относительно CIFAR-10, что странно, так как количество данных одинаковое
+
 #### Распределение цветов
-#### Внутриклассовое распределение цветов
+![](https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_comparison.png)
+
+
+- **Сценовые суперклассы** (вода/небо/природа) чаще смещены в **зелёно-синие** тона и чуть светлее:
+  *aquatic_mammals*, *fish*, *large_natural_outdoor_scenes*, *trees*, *large_man-made_outdoor_things*.
+- **Объектные/индор** группы чаще **краснее** или близки к нейтрали:
+  *flowers*, *fruit_and_vegetables*, *household_furniture*, *household_electrical_devices*, *people*.
+- Самые **светлые** в среднем: *household_furniture*, *household_electrical_devices*, *food_containers*, *vehicles_2*.
+- Самые **тёмные**: *flowers*, *medium_mammals*, *large_carnivores*, затем *fish*.
+
+
+> В отличие от CIFAR-10 (где «синие» в основном *airplane/ship*), в CIFAR-100 много сценовых групп с устойчивой G/B-доминантой и больше ярких индор-классов.  
+> Из-за малого числа примеров на класс и похожих цветовых профилей внутри суперклассов нужны сильнее аугментации и регуляризация, иначе модель переучится на цвет.
+
+
+#### Распределение цветов по суперклассам
+Так как датасет содержит суперклассы, то сравнение распределений мы будем проводить отдельно между всеми данными и суперклассами и внутри суперклассов.
+Суперклассы food_containers, household_electrical_devices, household_furniture, insects, large_man-made_outdoor_things, vehicles_2 имеют повышенную яркость.
+Если смотреть на доминирующий цвет, то суперклассы flowers и fruit_and_vegetables имеют ярко выраженное смещение в сторону красного; aquatic_mammals, large_man-made_outdoor_things и large_natural_outdoor_scenes в сторону синего; fish и trees в сторону зеленого.
+В остальных суперклассах преобладает красный, но незначительно.
+
+Нетипичные гистограммы внутри суперклассов:
+| Суперкласс | Класс | Изображенийе | Комментарий |
+|---|---|---|---|
+| +aquatic_mammals | beaver | !(https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_04_beaver.png) | В классе beaver суперкласса aquatic_mammals распределение синего цвета значительно ниже чем по суперклассу |
+| +aquatic_mammals | whale | !(https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_95_whale.png) | В классе whale суперкласса aquatic_mammals распределение синего цвета выше чем по суперклассу |
+| fish | aquarium_fish | !(https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_01_aquarium_fish.png) | В классе aquarium_fish суперкласса fish распределение синего цвета гораздо ниже чем по суперклассу | 
+| large_natural_outdoor_scenes | cloud | !(https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_23_cloud.png) | В классе cloud суперкласса large_natural_outdoor_scenes распределение синего цвета выше чем по суперклассу |
+| large_natural_outdoor_scenes | forest | !(https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_33_forest.png) | В классе fotrest суперкласса large_natural_outdoor_scenes распределение синего цвета ниже чем по суперклассу |
+| large_natural_outdoor_scenes | sea | !(https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_71_sea.png) | В классе sea суперкласса large_natural_outdoor_scenes распределение синего цвета значительно выше чем по суперклассу |
+| large_omnivores_and_herbivores  | chimpanzee | !(https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_21_chimpanzee.png) | В классе chimpanzee суперкласса large_omnivores_and_herbivores распределение красного и зеленого цветов ниже чем по суперклассу |
+
+> Цветовые профили существенно различаются по суперклассам: сценовые группы чаще смещены в G/B, объектные/индор — в R и имеют повышенную яркость (food_containers, household_electrical_devices, household_furniture, insects, large_man-made_outdoor_things, vehicles_2).
+> Внутри суперклассов есть нетипичные классы (напр., whale/cloud/sea — «очень синие», forest/aquarium_fish — «темнее/менее синие», chimpanzee — «менее R и G»), при этом в общем классы внутри супкркласса похожи.
+
 ### Качество датасета
-### Аугмекнтации
+
+### Качество датасета
+
+> Файлы и метки целостные; пропуски и выбросы не выявлены. Датасет полностью сбалансирован (100 классов по 1% данных, 20 суперклассов по 5%) и не требует очистки или ребалансировки для старта. 
+
+### Аугментации
+
+Для CIFAR-100 (32×32, **100 классов по 1% данных**) нужны **чуть более агрессивные** аугментации, чем для CIFAR-10:
+
+- RandomCrop(32, padding=4) + HorizontalFlip — базовая инвариантность к сдвигам/ракурсу на маленьких картинках.  
+- Умеренно-сильный ColorJitter (яркость/контраст/насыщенность ≈ 0.2; hue ≤ 0.05) или AutoContrast — снижает зависимость от освещения/фона.  
+- RandAugment / TrivialAugmentWide (умеренная сила; напр., *n=2, m=12±2*) — добавляет форм/текстур, что важно при малом числе примеров на класс.  
+- Cutout / RandomErasing (*p=0.25–0.5*, *scale=0.02–0.33*) — мешает переобучению на локальные пиксели и фон.  
+- MixUp (α=0.2–0.4) или CutMix (α≈1.0) — сглаживают границы классов, повышают устойчивость к шуму разметки.  
+- *(Опционально)* Grayscale/ColorDropout (p≈0.1) — ломает цветовые «шорткаты» в сценовых суперклассах.  
+
+- Нормализация стандартными для CIFAR-100 mean/std — стабилизирует обучение.
+
+> Почему сильнее, чем для CIFAR-10: на класс мало примеров (1%) и много близких категорий внутри суперклассов → нужна более сильная регуляризация, чтобы модель училась на устойчивых признаках, а не на цвете/фоне.
+
 ### Вывод
+CIFAR-100 сбалансирован (100 классов по 1% данных; 20 суперклассов по 5%) и заметно сложнее, чем CIFAR-10: меньше примеров на класс, тонкие межклассовые различия внутри суперклассов и сценовые категории усиливают зависимость моделей от фона и цвета. Для стабильного обобщения нужны более сильные аугментации и регуляризация (Rand/TrivialAugment, MixUp/CutMix, RandomErasing/Cutout, умеренный ColorJitter/AutoContrast), стандартная нормализация и контроль метрик не только top-1/top-5, но и macro-средних и по суперклассам. CIFAR-100 — оптимальный «средний» бенчмарк после CIFAR-10 и до Tiny ImageNet: он хорошо выявляет пользу архитектурных улучшений и регуляризации, но требует более тщательного подбора гиперпараметров и большего числа эпох.
