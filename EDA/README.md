@@ -30,7 +30,7 @@
     - [Усреднение изображений по классам](#eda-tiny-imagenet-usrednenie-izobrazheniy-po-klassam)
     - [Цветовой анализ](#eda-tiny-imagenet-tsvetovoy-analiz)
     - [Качество датасета](#eda-tiny-imagenet-kachestvo-dataseta)
-    - [Аугмекнтации](#eda-tiny-imagenet-augmekntatsii)
+    - [Аугментации](#eda-tiny-imagenet-augmekntatsii)
     - [Вывод](#eda-tiny-imagenet-vyvod)
 
 
@@ -349,8 +349,8 @@ vehicles_2
 Нетипичные гистограммы внутри суперклассов:
 | Суперкласс | Класс | Изображение | Комментарий |
 |---|---|---|---|
-| +aquatic_mammals | beaver | ![](https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_04_beaver.png) | В классе beaver суперкласса aquatic_mammals распределение синего цвета значительно ниже чем по суперклассу |
-| +aquatic_mammals | whale | ![](https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_95_whale.png) | В классе whale суперкласса aquatic_mammals распределение синего цвета выше чем по суперклассу |
+| aquatic_mammals | beaver | ![](https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_04_beaver.png) | В классе beaver суперкласса aquatic_mammals распределение синего цвета значительно ниже чем по суперклассу |
+| aquatic_mammals | whale | ![](https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_95_whale.png) | В классе whale суперкласса aquatic_mammals распределение синего цвета выше чем по суперклассу |
 | fish | aquarium_fish | ![](https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_01_aquarium_fish.png) | В классе aquarium_fish суперкласса fish распределение синего цвета гораздо ниже чем по суперклассу | 
 | large_natural_outdoor_scenes | cloud | ![](https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_23_cloud.png) | В классе cloud суперкласса large_natural_outdoor_scenes распределение синего цвета выше чем по суперклассу |
 | large_natural_outdoor_scenes | forest | ![](https://github.com/takumi19/DistLearn/blob/main/EDA/eda_cifar100/superclass_color_analysis/superclass_histograms_33_forest.png) | В классе fotrest суперкласса large_natural_outdoor_scenes распределение синего цвета ниже чем по суперклассу |
