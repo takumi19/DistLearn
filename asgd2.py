@@ -62,6 +62,13 @@ class ParameterServer(object):
     @staticmethod
     @rpc.functions.async_execution
     def barrier(ps_rref):
+        """
+        Барьер по эпохам:
+
+        - каждый воркер в конце эпохи вызывает эту функцию;
+        - PS ждёт, пока отметятся все (num_workers - 1) воркеров;
+        - потом выпускает их в следующую эпоху.
+        """
         self = ps_rref.local_value()
         with self.lock:
             if self.epoch_barrier_future is None:
@@ -76,6 +83,11 @@ class ParameterServer(object):
 
     # Caller holds lock
     def _aggregate_params(self, params, worker_rank):
+        """
+        Принимает параметры (веса) от воркера, копит их,
+        усредняет по всем воркерам, обновляет глобальную модель на PS
+        и возвращает воркерам список усреднённых параметров.
+        """
         self.params.append(params)
         print(
             f"PS received params from worker{worker_rank} "
@@ -108,12 +120,18 @@ class ParameterServer(object):
     @staticmethod
     @rpc.functions.async_execution
     def update_lr(ps_rref):
-        # шедулер теперь на воркерах
+        # lr-шедулер теперь на воркерах
         return
 
     @staticmethod
     @rpc.functions.async_execution
     def update_and_fetch_model(ps_rref, params, worker_rank):
+        """
+        RPC-функция для воркеров.
+
+        - params — список тензоров параметров (весов), присланных воркером;
+        - возвращает Future со списком усреднённых параметров avg_params.
+        """
         self = ps_rref.local_value()
         with self.lock:
             fut = self._aggregate_params(params, worker_rank)
@@ -123,6 +141,13 @@ class ParameterServer(object):
 def stats(
     model: nn.Module, device: str, loader: DataLoader, criterion: nn.Module, name: str
 ) -> tuple[float, float, float, pd.DataFrame]:
+    """
+    Валидация (или тест):
+
+    - временно переключает модель в eval;
+    - считает loss, accuracy, F1;
+    - потом возвращает модель в исходный режим (train/eval).
+    """
     was_training = model.training
 
     model.eval()
