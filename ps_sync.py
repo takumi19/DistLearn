@@ -329,10 +329,10 @@ def main():
     args = parse_args()
     _ = datasets.CIFAR100(root=args.data_dir, download=True)
 
-    options = rpc.TensorPipeRpcBackendOptions(
-        num_worker_threads=16,
-        rpc_timeout=999999999,
-    )
+    # options = rpc.RpcBackendOptions(
+    #     num_send_recv_threads=16, # Or whatever you need
+    #     rpc_timeout=dt.timedelta(seconds=60) # Set a generous timeout, e.g., 60 seconds
+    # )
 
     os.environ["MASTER_ADDR"] = args.master_addr
     os.environ["MASTER_PORT"] = str(args.master_port)
@@ -342,7 +342,7 @@ def main():
             "ps",
             rank=args.rank,
             world_size=args.world_size,
-            rpc_backend_options=options,
+            # rpc_backend_options=options,
         )
         ps_rref = rpc.RRef(
             ParameterServer(
@@ -389,7 +389,7 @@ def main():
             f"worker{args.rank}",
             rank=args.rank,
             world_size=args.world_size,
-            rpc_backend_options=options,
+            # rpc_backend_options=options,
         )
         print(f"Worker{args.rank} initialized")
 
