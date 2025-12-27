@@ -1,0 +1,21 @@
+syntax="proto3";
+
+message TensorProto {
+  bytes data = 1;
+  string dtype = 2;
+  repeated int64 shape = 3;
+}
+
+message UpdateRequest {
+  repeated TensorProto gradients = 1;
+  int32 rank = 2;
+}
+
+message UpdateResponse {
+  repeated TensorProto parameters = 1;
+}
+
+service ParameterServer {
+  rpc AsyncUpdate(UpdateRequest) returns (UpdateResponse) {}
+  rpc SyncUpdate(UpdateRequest) returns (UpdateResponse) {}
+}
