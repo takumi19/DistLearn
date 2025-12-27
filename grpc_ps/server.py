@@ -1,14 +1,13 @@
 import threading
+
 import grpc
+import numpy as np
+import proto.ps_pb2_grpc as ps_grpc
 import torch
+from helpers import deserialize_tensor, serialize_tensor
+from proto.ps_pb2 import UpdateRequest, UpdateResponse
 from torch import optim
 from torch.utils.data import DataLoader
-
-import proto.ps_pb2_grpc as ps_grpc
-from proto.ps_pb2 import UpdateRequest, UpdateResponse, TensorProto
-
-import numpy as np
-from helpers import serialize_tensor, deserialize_tensor
 
 
 class ParameterServerServicer(ps_grpc.ParameterServerServicer):
@@ -34,14 +33,7 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
         raise NotImplementedError("kaboom")
 
     def AsyncUpdate(self, request: UpdateRequest, context: grpc.ServicerContext):
-        grads = [
-            deserialize_tensor(
-                tensor_proto.data,
-                tuple(tensor_proto.shape),
-                np.dtype(tensor_proto.dtype),
-            )
-            for tensor_proto in request.gradients
-        ]
+        grads = [deserialize_tensor(tensor_proto) for tensor_proto in request.gradients]
 
         with self.lock:
             with torch.no_grad():
@@ -54,12 +46,7 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
             return self._make_update_response()
 
     def _make_update_response(self) -> UpdateResponse:
+        # WARN: Not sure if parameters and regular tensors can be used interchangeably
         return UpdateResponse(
-            parameters=[
-                TensorProto(
-                    *serialize_tensor(p),
-                    shape=p.shape,
-                )
-                for p in self.model.parameters()
-            ]
+            parameters=[serialize_tensor(p) for p in self.model.parameters()]
         )

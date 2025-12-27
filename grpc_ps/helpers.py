@@ -1,13 +1,14 @@
-import torch
 import numpy as np
+import torch
+from proto.ps_pb2 import TensorProto
 
 
-def serialize_tensor(t: torch.Tensor):
-    array = t.contiguous().numpy()
-    return array.tobytes(), str(array.dtype)
+def serialize_tensor(tp: torch.Tensor) -> TensorProto:
+    array = tp.contiguous().numpy()
+    return TensorProto(data=array.tobytes(), dtype=str(array.dtype), shape=tp.shape)
 
 
-def deserialize_tensor(data: bytes, shape: tuple, dtype: np.dtype):
-    array = np.frombuffer(data, dtype=dtype)
-    tensor = torch.from_numpy(array).reshape(shape)
+def deserialize_tensor(tp: TensorProto) -> torch.Tensor:
+    array = np.frombuffer(tp.data, dtype=tp.dtype)
+    tensor = torch.from_numpy(array).reshape(tp.shape)
     return tensor

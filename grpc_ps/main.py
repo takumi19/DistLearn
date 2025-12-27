@@ -1,8 +1,9 @@
 import argparse
 import grpc
 from concurrent import futures
-from proto.ps_pb2_grpc import add_ParameterServerServicer_to_server
+from proto.ps_pb2_grpc import add_ParameterServerServicer_to_server, ParameterServerStub
 from server import ParameterServerServicer
+from worker import worker
 from datetime import datetime
 
 import torch
@@ -13,22 +14,32 @@ from torchvision import transforms, datasets, models
 def main():
     start_time = str(datetime.now()).split(".", 1)[0].replace(" ", "T")
     args = parse_args()
-    train_loader, val_loader, test_loader, train_sampler = load_datasets(
+    train_loader, val_loader, _, train_sampler = load_datasets(
         args.data_dir, args.batch_size, args.rank, args.world_size
     )
+    model = models.resnet18(num_classes=100)
+
     if args.rank == 0:
         srv = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
         add_ParameterServerServicer_to_server(
-            ParameterServerServicer(
-                models.resnet18(num_classes=100), args.world_size, val_loader
-            ),
+            ParameterServerServicer(model, args.world_size, val_loader),
             srv,
         )
         srv.add_insecure_port(f"[::]:{args.port}")
         srv.start()
         srv.wait_for_termination()
     else:
-        pass
+        channel = grpc.insecure_channel(f"localhost:{args.port}")
+        ps = ParameterServerStub(channel)
+        worker(
+            model,
+            train_loader,
+            train_sampler,
+            ps,
+            args.rank,
+            args.num_epochs,
+            start_time,
+        )
 
 
 def parse_args() -> argparse.Namespace:
