@@ -9,6 +9,7 @@ message TensorProto {
 message UpdateRequest {
   repeated TensorProto gradients = 1;
   int32 rank = 2;
+  int32 epoch = 3;
 }
 
 message UpdateResponse {

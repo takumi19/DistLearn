@@ -1,45 +1,70 @@
 import argparse
-import grpc
+import os
 from concurrent import futures
-from proto.ps_pb2_grpc import add_ParameterServerServicer_to_server, ParameterServerStub
-from server import ParameterServerServicer
-from worker import worker
 from datetime import datetime
 
+import grpc
 import torch
+from proto.ps_pb2_grpc import ParameterServerStub, add_ParameterServerServicer_to_server
+from server import ParameterServerServicer
 from torch.utils.data import DataLoader, DistributedSampler, random_split
-from torchvision import transforms, datasets, models
+from torchvision import datasets, models, transforms
+from worker import worker
+
+# XXX: Maybe increasing the max message length is not a great idea, we can stream the tensors one by one
+MAX_MESSAGE_LENGTH = 50000000
 
 
 def main():
     start_time = str(datetime.now()).split(".", 1)[0].replace(" ", "T")
+    os.makedirs(f"model_weights/{start_time}")
+    os.makedirs(f"logs/{start_time}")
     args = parse_args()
     train_loader, val_loader, _, train_sampler = load_datasets(
         args.data_dir, args.batch_size, args.rank, args.world_size
     )
     model = models.resnet18(num_classes=100)
+    criterion = torch.nn.CrossEntropyLoss()
 
+    server_addr = f"{args.master_addr}:{args.master_port}"
     if args.rank == 0:
-        srv = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+        srv = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=10),
+            options=[
+                ("grpc.max_send_message_length", MAX_MESSAGE_LENGTH),
+                ("grpc.max_receive_message_length", MAX_MESSAGE_LENGTH),
+            ],
+        )
         add_ParameterServerServicer_to_server(
-            ParameterServerServicer(model, args.world_size, val_loader),
+            ParameterServerServicer(model, args.world_size, val_loader, criterion),
             srv,
         )
-        srv.add_insecure_port(f"[::]:{args.port}")
+        print(f"Starting the server on {server_addr}")
+        srv.add_insecure_port(server_addr)
         srv.start()
         srv.wait_for_termination()
     else:
-        channel = grpc.insecure_channel(f"localhost:{args.port}")
-        ps = ParameterServerStub(channel)
-        worker(
-            model,
-            train_loader,
-            train_sampler,
-            ps,
-            args.rank,
-            args.num_epochs,
-            start_time,
-        )
+        with grpc.insecure_channel(
+            server_addr,
+            options=[
+                ("grpc.max_send_message_length", MAX_MESSAGE_LENGTH),
+                ("grpc.max_receive_message_length", MAX_MESSAGE_LENGTH),
+            ],
+        ) as channel:
+            # channel = grpc.insecure_channel(f"localhost:{args.port}")
+            print("Starting the client")
+            ps = ParameterServerStub(channel)
+            worker(
+                model,
+                train_loader,
+                train_sampler,
+                ps,
+                args.rank,
+                args.num_epochs,
+                start_time,
+                criterion,
+                args.sync,
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,7 +114,7 @@ def parse_args() -> argparse.Namespace:
 
 def load_datasets(
     data_dir: str, batch_size: int, rank: int, world_size: int
-) -> tuple[DataLoader, DataLoader, DataLoader, DistributedSampler]:
+) -> tuple[DataLoader | None, DataLoader, DataLoader | None, DistributedSampler | None]:
     transform_train = transforms.Compose(
         [
             transforms.RandomCrop(32, padding=4),
@@ -103,7 +128,7 @@ def load_datasets(
         ]
     )
 
-    full_train_dataset = datasets.CIFAR100(
+    full_train_dataset = datasets.CIFAR10(
         root=data_dir, train=True, download=False, transform=transform_train
     )
     train_size = int(0.9 * len(full_train_dataset))
@@ -114,17 +139,19 @@ def load_datasets(
         generator=torch.Generator(),
     )
     val_dataset.dataset.transform = transform_val
-    test_dataset = datasets.CIFAR100(
+    test_dataset = datasets.CIFAR10(
         root=data_dir, train=False, download=False, transform=transform_val
     )
 
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    if rank == 0:
+        return None, val_loader, None, None
     sampler = DistributedSampler(
         dataset=train_dataset, num_replicas=world_size - 1, rank=rank - 1
     )
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, sampler=sampler, shuffle=False
     )
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     return train_loader, val_loader, test_loader, sampler

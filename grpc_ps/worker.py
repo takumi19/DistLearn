@@ -1,8 +1,10 @@
+import os
 import time
 
 import pandas as pd
 import torch
-from proto.ps_pb2 import UpdateRequest
+from helpers import deserialize_tensor, serialize_tensor
+from proto.ps_pb2 import UpdateRequest, UpdateResponse
 from proto.ps_pb2_grpc import ParameterServerStub
 from torch import optim
 from torch.utils.data import DataLoader, DistributedSampler
@@ -16,6 +18,7 @@ def worker(
     rank: int,
     n_epochs: int,
     start_time: str,
+    criterion: torch.nn.Module,
     sync: bool = True,
 ):
     tt0 = time.time()
@@ -24,7 +27,6 @@ def worker(
     val_metrics = []
     device = "cpu"
 
-    criterion = torch.nn.CrossEntropyLoss()
     optimizer = optim.SGD(
         model.parameters(),
         lr=0.01,
@@ -34,12 +36,16 @@ def worker(
     )
 
     for epoch in range(n_epochs):
+        print(f"Epoch {epoch} started")
         model.train()
         train_sampler.set_epoch(epoch)
 
         correct = 0
         total = 0
         epoch_loss = 0.0
+        initial_params = {
+            name: param.clone().detach() for name, param in model.named_parameters()
+        }
 
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
@@ -64,14 +70,36 @@ def worker(
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        # After epoch
-        req = UpdateRequest()
+            if os.environ["TEST"] == "1":
+                break
+
+        # NOTE: Maybe average the grads by the number of workers here
+        print(f"Sending the updates to the server for {epoch=}")
+        final_params = {
+            name: param.clone().detach() for name, param in model.named_parameters()
+        }
+
+        # grads = []
+        # for name in initial_params:
+        #     initial_param = initial_params[name]
+        #     final_param = final_params[name]
+        #     if initial_param.shape != final_param.shape:
+        #         print(f"{name} parameter changed shape")
+        #     else:
+        #         grads.append(serialize_tensor(final_param - initial_param))
+        grads = [
+            serialize_tensor(final_params[name] - initial_params[name])
+            for name in initial_params
+        ]
+        req = UpdateRequest(gradients=grads, rank=rank, epoch=epoch)
         if sync:
             resp = ps.SyncUpdate(req)
         else:
             resp = ps.AsyncUpdate(req)
-        # TODO: Properly update model parameters
-        _ = resp
+
+        with torch.no_grad():
+            for curr_param, updated_param in zip(model.parameters(), resp.parameters):
+                curr_param.copy_(deserialize_tensor(updated_param))
 
         torch.save(
             model.state_dict(),
