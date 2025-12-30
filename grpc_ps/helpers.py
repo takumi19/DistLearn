@@ -11,5 +11,5 @@ def serialize_tensor(tp: torch.Tensor) -> TensorProto:
 
 def deserialize_tensor(tp: TensorProto) -> torch.Tensor:
     array = np.frombuffer(tp.data, dtype=tp.dtype)
-    tensor = torch.from_numpy(array).reshape(tuple(tp.shape))
+    tensor = torch.from_numpy(array.copy()).reshape(tuple(tp.shape))
     return tensor
