@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
         help="The learning rate for SGD with momentum.",
     )
     parser.add_argument(
-        "--master_addr", type=str, default="localhost", help="The hostname of master."
+        "--master_addr", type=str, default="0.0.0.0", help="The hostname of master."
     )
     parser.add_argument(
         "--master_port", type=int, default=50051, help="The master port."
