@@ -70,7 +70,7 @@ def worker(
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-            if os.environ["TEST"] == "1":
+            if "TEST" in os.environ and os.environ["TEST"] == "1":
                 break
 
         # NOTE: Maybe average the grads by the number of workers here
@@ -79,14 +79,6 @@ def worker(
             name: param.clone().detach() for name, param in model.named_parameters()
         }
 
-        # grads = []
-        # for name in initial_params:
-        #     initial_param = initial_params[name]
-        #     final_param = final_params[name]
-        #     if initial_param.shape != final_param.shape:
-        #         print(f"{name} parameter changed shape")
-        #     else:
-        #         grads.append(serialize_tensor(final_param - initial_param))
         grads = [
             serialize_tensor(final_params[name] - initial_params[name])
             for name in initial_params
@@ -122,4 +114,5 @@ def worker(
     pd.DataFrame(batch_records).to_csv(
         f"logs/{start_time}/batches_worker_{rank}.csv", index=False
     )
-    # TODO: Maybe add validation
+    # NOTE: Maybe add validation
+    print("Done")

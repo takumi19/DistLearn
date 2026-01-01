@@ -12,7 +12,7 @@ from torchvision import datasets, models, transforms
 from worker import worker
 
 # XXX: Maybe increasing the max message length is not a great idea, we can stream the tensors one by one
-MAX_MESSAGE_LENGTH = 50000000
+MAX_MESSAGE_LENGTH = 100000000
 
 
 def main():
@@ -128,7 +128,7 @@ def load_datasets(
         ]
     )
 
-    full_train_dataset = datasets.CIFAR10(
+    full_train_dataset = datasets.CIFAR100(
         root=data_dir, train=True, download=False, transform=transform_train
     )
     train_size = int(0.9 * len(full_train_dataset))
@@ -139,7 +139,7 @@ def load_datasets(
         generator=torch.Generator(),
     )
     val_dataset.dataset.transform = transform_val
-    test_dataset = datasets.CIFAR10(
+    test_dataset = datasets.CIFAR100(
         root=data_dir, train=False, download=False, transform=transform_val
     )
 
