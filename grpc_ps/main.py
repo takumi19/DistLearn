@@ -12,7 +12,7 @@ from torchvision import datasets, models, transforms
 from worker import worker
 
 # XXX: Maybe increasing the max message length is not a great idea, we can stream the tensors one by one
-MAX_MESSAGE_LENGTH = 100000000
+MAX_MESSAGE_LENGTH = 50 * 1024 * 1024
 
 
 def main():
@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         "--batch_size", type=int, default=32, help="The number of images per batch."
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=90, help="The number of epochs for training."
+        "--num_epochs", type=int, default=180, help="The number of epochs for training."
     )
     parser.add_argument(
         "--lr",

@@ -1,4 +1,5 @@
 import threading
+import time
 
 import grpc
 import proto.ps_pb2_grpc as ps_grpc
@@ -50,10 +51,11 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
                 self.aggregated_grads = []
                 print("Updated params")
                 self.sync_done.set()
-                # TODO: Run validation
-                threading.Thread(
+                # NOTE: Multiprocessing might be a better fit for running validation
+                thr = threading.Thread(
                     name=f"Validation-{request.epoch}", target=self._run_validation
                 )
+                thr.start()
                 return self._make_update_response()
 
         print(f"{request.rank} waiting for all...")
@@ -66,7 +68,6 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
             return self._make_update_response()
 
     def AsyncUpdate(self, request: UpdateRequest, context: grpc.ServicerContext):
-        # TODO: Should probably divide by the number of workers here
         grads = [
             deserialize_tensor(tensor_proto) / (self.world_size - 1)
             for tensor_proto in request.gradients
@@ -79,21 +80,21 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
                     new_param = p + g
                     p.copy_(new_param)
 
-            # TODO: if % world size - 1 -> run validation
             if self.req_cnt == 0:
-                threading.Thread(
+                thr = threading.Thread(
                     name=f"Validation-{request.epoch}", target=self._run_validation
                 )
+                thr.start()
             return self._make_update_response()
 
     def _make_update_response(self) -> UpdateResponse:
-        # WARN: Not sure if parameters and regular tensors can be used interchangeably
         return UpdateResponse(
             parameters=[serialize_tensor(p) for p in self.model.parameters()]
         )
 
     def _run_validation(self):
-        # self.lock.acquire()
+        # HACK: Sleep here a little bit so that the lock does not get held before we send back the response to the workers
+        time.sleep(3)
         with self.lock:
             print("Running validation...")
             was_training = self.model.training
