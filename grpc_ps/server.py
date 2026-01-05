@@ -1,7 +1,9 @@
-from itertools import chain
+import os
 import threading
-from typing import Iterable
 import time
+from datetime import datetime
+from itertools import chain
+from typing import Iterable
 
 import grpc
 import proto.ps_pb2_grpc as ps_grpc
@@ -12,7 +14,13 @@ from helpers import (
     serialize_tensor,
     tensor_to_chunks,
 )
-from proto.ps_pb2 import UpdateRequest, UpdateResponse, TensorChunk
+from proto.ps_pb2 import (
+    GetStartTimeArgs,
+    GetStartTimeReply,
+    TensorChunk,
+    UpdateRequest,
+    UpdateResponse,
+)
 from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader
 
@@ -35,8 +43,11 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
         self.sync_done = threading.Event()
         self.req_cnt = 0  # For the async function to run validation
         self.aggregated_buffers: list[list[torch.Tensor]] = []
+        self.start_time = str(datetime.now()).split(".", 1)[0].replace(" ", "T")
+        os.makedirs(f"model_weights/{self.start_time}", exist_ok=True)
+        os.makedirs(f"logs/{self.start_time}", exist_ok=True)
 
-    def StreamingSyncUpdate(
+    def SyncUpdate(
         self, request_iterator: Iterable[TensorChunk], context: grpc.ServicerContext
     ) -> Iterable[TensorChunk]:
         chunks: list[TensorChunk] = []
@@ -98,44 +109,6 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
         print(f"S[{rank}] receiving chunks")
         yield from self._chunk_stream()
 
-    def SyncUpdate(self, request: UpdateRequest, context: grpc.ServicerContext):
-        with self.lock:
-            print(f"Received updates from {request.rank} for epoch {request.epoch}")
-            grads = [
-                deserialize_tensor(tensor_proto) for tensor_proto in request.gradients
-            ]
-            self.aggregated_grads.append(grads)
-
-            if len(self.aggregated_grads) == self.world_size - 1:
-                avg_grads = [
-                    sum(g[i] for g in self.aggregated_grads) / (self.world_size - 1)
-                    for i in range(len(self.aggregated_grads[0]))
-                ]
-
-                with torch.no_grad():
-                    for p, g in zip(self.model.parameters(), avg_grads):
-                        new_param = p + g
-                        p.copy_(new_param)
-
-                self.aggregated_grads = []
-                print("Updated params")
-                self.sync_done.set()
-                # NOTE: Multiprocessing might be a better fit for running validation
-                thr = threading.Thread(
-                    name=f"Validation-{request.epoch}", target=self._run_validation
-                )
-                thr.start()
-                return self._make_update_response()
-
-        print(f"{request.rank} waiting for all...")
-        self.sync_done.wait()
-
-        with self.lock:
-            if self.sync_done.is_set():
-                self.sync_done.clear()
-            print(f"Sending response to {request.rank}")
-            return self._make_update_response()
-
     def AsyncUpdate(self, request: UpdateRequest, context: grpc.ServicerContext):
         grads = [
             deserialize_tensor(tensor_proto) / (self.world_size - 1)
@@ -155,6 +128,11 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
                 )
                 thr.start()
             return self._make_update_response()
+
+    def GetStartTime(
+        self, request: GetStartTimeArgs, context: grpc.ServicerContext
+    ) -> GetStartTimeReply:
+        return GetStartTimeReply(timestamp=self.start_time)
 
     def _make_update_response(self) -> UpdateResponse:
         return UpdateResponse(

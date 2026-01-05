@@ -1,7 +1,5 @@
 import argparse
-import os
 from concurrent import futures
-from datetime import datetime
 
 import grpc
 import torch
@@ -19,9 +17,6 @@ MAX_MESSAGE_LENGTH = -1
 
 
 def main():
-    start_time = str(datetime.now()).split(".", 1)[0].replace(" ", "T")
-    os.makedirs(f"model_weights/{start_time}", exist_ok=True)
-    os.makedirs(f"logs/{start_time}", exist_ok=True)
     args = parse_args()
     train_loader, val_loader, _, train_sampler = load_datasets(
         args.data_dir, args.batch_size, args.rank, args.world_size
@@ -31,13 +26,7 @@ def main():
 
     server_addr = f"{args.master_addr}:{args.master_port}"
     if args.rank == 0:
-        srv = grpc.server(
-            futures.ThreadPoolExecutor(max_workers=10),
-            options=[
-                ("grpc.max_send_message_length", MAX_MESSAGE_LENGTH),
-                ("grpc.max_receive_message_length", MAX_MESSAGE_LENGTH),
-            ],
-        )
+        srv = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
         add_ParameterServerServicer_to_server(
             ParameterServerServicer(model, args.world_size, val_loader, criterion),
             srv,
@@ -47,14 +36,7 @@ def main():
         srv.start()
         srv.wait_for_termination()
     else:
-        with grpc.insecure_channel(
-            server_addr,
-            options=[
-                ("grpc.max_send_message_length", MAX_MESSAGE_LENGTH),
-                ("grpc.max_receive_message_length", MAX_MESSAGE_LENGTH),
-            ],
-        ) as channel:
-            # channel = grpc.insecure_channel(f"localhost:{args.port}")
+        with grpc.insecure_channel(server_addr) as channel:
             print("Starting the client")
             ps = ParameterServerStub(channel)
             worker(
@@ -64,21 +46,14 @@ def main():
                 ps,
                 args.rank,
                 args.num_epochs,
-                start_time,
                 criterion,
                 args.sync,
                 args.lr,
-                args.streaming,
             )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--streaming",
-        action="store_true",
-        help="Use streaming instead of batch update.",
-    )
     parser.add_argument("--model", type=str, default="resnet18", help="Model name.")
     parser.add_argument(
         "--rank", type=int, default=1, help="Global rank of this process."

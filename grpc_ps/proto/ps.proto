@@ -25,12 +25,20 @@ message TensorChunk {
   bool is_last = 4;
 }
 
-service ParameterServer {
-  rpc AsyncUpdate(UpdateRequest) returns (UpdateResponse) {}
-  rpc SyncUpdate(UpdateRequest) returns (UpdateResponse) {}
+message GetStartTimeReply {
+  string timestamp = 1;
+}
 
-  rpc StreamingSyncUpdate(stream TensorChunk) returns (stream TensorChunk) {}
-  rpc StreamingAsyncUpdate(stream TensorChunk) returns (stream TensorChunk) {}
+message GetStartTimeArgs {}
+
+service ParameterServer {
+  // rpc AsyncUpdate(UpdateRequest) returns (UpdateResponse) {}
+  // rpc SyncUpdate(UpdateRequest) returns (UpdateResponse) {}
+
+  rpc SyncUpdate(stream TensorChunk) returns (stream TensorChunk) {}
+  rpc AsyncUpdate(stream TensorChunk) returns (stream TensorChunk) {}
+
+  rpc GetStartTime(GetStartTimeArgs) returns (GetStartTimeReply) {}
 }
 
 // service StreamingParameterServer {

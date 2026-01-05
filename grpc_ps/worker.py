@@ -8,7 +8,7 @@ from helpers import (
     chunks_to_tensor,
     tensor_to_chunks,
 )
-from proto.ps_pb2 import TensorChunk
+from proto.ps_pb2 import GetStartTimeArgs, TensorChunk
 from proto.ps_pb2_grpc import ParameterServerStub
 from torch import optim
 from torch.utils.data import DataLoader, DistributedSampler
@@ -21,12 +21,14 @@ def worker(
     ps: ParameterServerStub,
     rank: int,
     n_epochs: int,
-    start_time: str,
     criterion: torch.nn.Module,
     sync: bool = True,
     max_lr=1e-2,
-    streaming: bool = False,
 ):
+    start_time = ps.GetStartTime(GetStartTimeArgs()).timestamp
+    os.makedirs(f"model_weights/{start_time}", exist_ok=True)
+    os.makedirs(f"logs/{start_time}", exist_ok=True)
+
     epoch_metrics = []
     batch_records = []
     device = "cpu"
@@ -83,24 +85,21 @@ def worker(
 
         print(f"Sending the updates to the server for {epoch=}")
 
-        if streaming:
-            metadata = (("rank", str(rank)), ("epoch", str(epoch)))
-            resp_iter: Iterable[TensorChunk] = ps.StreamingSyncUpdate(
-                tensor_stream(initial_params, initial_buffers, model),
-                metadata=metadata,
-            )
+        metadata = (("rank", str(rank)), ("epoch", str(epoch)))
+        resp_iter: Iterable[TensorChunk] = ps.SyncUpdate(
+            tensor_stream(initial_params, initial_buffers, model),
+            metadata=metadata,
+        )
 
-            params_and_bufs = chain(model.parameters(), model.buffers())
-            chunks: list[TensorChunk] = []
-            for chunk in resp_iter:
-                chunks.append(chunk)
-                if chunk.is_last:
-                    tensor = chunks_to_tensor(chunks)
-                    with torch.no_grad():
-                        next(params_and_bufs).copy_(tensor)
-                    chunks.clear()
-        else:
-            raise NotImplementedError()
+        params_and_bufs = chain(model.parameters(), model.buffers())
+        chunks: list[TensorChunk] = []
+        for chunk in resp_iter:
+            chunks.append(chunk)
+            if chunk.is_last:
+                tensor = chunks_to_tensor(chunks)
+                with torch.no_grad():
+                    next(params_and_bufs).copy_(tensor)
+                chunks.clear()
 
         torch.save(
             model.state_dict(),
