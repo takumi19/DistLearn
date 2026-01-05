@@ -10,13 +10,30 @@ message UpdateRequest {
   repeated TensorProto gradients = 1;
   int32 rank = 2;
   int32 epoch = 3;
+  TensorProto parameter_update = 4;
 }
 
 message UpdateResponse {
   repeated TensorProto parameters = 1;
+  TensorProto parameter = 2;
+}
+
+message TensorChunk {
+  bytes data = 1;
+  string dtype = 2;
+  repeated int64 shape = 3;
+  bool is_last = 4;
 }
 
 service ParameterServer {
   rpc AsyncUpdate(UpdateRequest) returns (UpdateResponse) {}
   rpc SyncUpdate(UpdateRequest) returns (UpdateResponse) {}
+
+  rpc StreamingSyncUpdate(stream TensorChunk) returns (stream TensorChunk) {}
+  rpc StreamingAsyncUpdate(stream TensorChunk) returns (stream TensorChunk) {}
 }
+
+// service StreamingParameterServer {
+//   rpc AsyncUpdate(stream UpdateRequest) returns (stream UpdateResponse) {}
+//   rpc SyncUpdate(stream UpdateRequest) returns (stream UpdateResponse) {}
+// }

@@ -5,20 +5,23 @@ from datetime import datetime
 
 import grpc
 import torch
-from proto.ps_pb2_grpc import ParameterServerStub, add_ParameterServerServicer_to_server
+from proto.ps_pb2_grpc import (
+    ParameterServerStub,
+    add_ParameterServerServicer_to_server,
+)
 from server import ParameterServerServicer
 from torch.utils.data import DataLoader, DistributedSampler, random_split
 from torchvision import datasets, models, transforms
 from worker import worker
 
 # XXX: Maybe increasing the max message length is not a great idea, we can stream the tensors one by one
-MAX_MESSAGE_LENGTH = 50 * 1024 * 1024
+MAX_MESSAGE_LENGTH = -1
 
 
 def main():
     start_time = str(datetime.now()).split(".", 1)[0].replace(" ", "T")
-    os.makedirs(f"model_weights/{start_time}")
-    os.makedirs(f"logs/{start_time}")
+    os.makedirs(f"model_weights/{start_time}", exist_ok=True)
+    os.makedirs(f"logs/{start_time}", exist_ok=True)
     args = parse_args()
     train_loader, val_loader, _, train_sampler = load_datasets(
         args.data_dir, args.batch_size, args.rank, args.world_size
@@ -64,11 +67,18 @@ def main():
                 start_time,
                 criterion,
                 args.sync,
+                args.lr,
+                args.streaming,
             )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Use streaming instead of batch update.",
+    )
     parser.add_argument("--model", type=str, default="resnet18", help="Model name.")
     parser.add_argument(
         "--rank", type=int, default=1, help="Global rank of this process."
@@ -86,7 +96,7 @@ def parse_args() -> argparse.Namespace:
         help="The location of dataset.",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=32, help="The number of images per batch."
+        "--batch_size", type=int, default=64, help="The number of images per batch."
     )
     parser.add_argument(
         "--num_epochs", type=int, default=180, help="The number of epochs for training."
@@ -120,11 +130,17 @@ def load_datasets(
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.5071, 0.4865, 0.4409), std=(0.2673, 0.2564, 0.2762)
+            ),
         ]
     )
     transform_val = transforms.Compose(
         [
             transforms.ToTensor(),
+            transforms.Normalize(
+                mean=(0.5071, 0.4865, 0.4409), std=(0.2673, 0.2564, 0.2762)
+            ),
         ]
     )
 

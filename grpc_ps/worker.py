@@ -1,10 +1,14 @@
 import os
-import time
+from itertools import chain
+from typing import Iterable
 
 import pandas as pd
 import torch
-from helpers import deserialize_tensor, serialize_tensor
-from proto.ps_pb2 import UpdateRequest, UpdateResponse
+from helpers import (
+    chunks_to_tensor,
+    tensor_to_chunks,
+)
+from proto.ps_pb2 import TensorChunk
 from proto.ps_pb2_grpc import ParameterServerStub
 from torch import optim
 from torch.utils.data import DataLoader, DistributedSampler
@@ -20,19 +24,22 @@ def worker(
     start_time: str,
     criterion: torch.nn.Module,
     sync: bool = True,
+    max_lr=1e-2,
+    streaming: bool = False,
 ):
-    tt0 = time.time()
     epoch_metrics = []
     batch_records = []
-    val_metrics = []
     device = "cpu"
 
     optimizer = optim.SGD(
         model.parameters(),
-        lr=0.01,
+        lr=max_lr,
         momentum=0.9,
-        # weight_decay=weight_decay,
+        weight_decay=1e-5,
         nesterov=True,
+    )
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr, n_epochs * len(train_loader)
     )
 
     for epoch in range(n_epochs):
@@ -43,9 +50,8 @@ def worker(
         correct = 0
         total = 0
         epoch_loss = 0.0
-        initial_params = {
-            name: param.clone().detach() for name, param in model.named_parameters()
-        }
+        initial_params = [param.clone().detach() for param in model.parameters()]
+        initial_buffers = [buffer.clone().detach() for buffer in model.buffers()]
 
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
@@ -73,25 +79,28 @@ def worker(
             if "TEST" in os.environ and os.environ["TEST"] == "1":
                 break
 
-        # NOTE: Maybe average the grads by the number of workers here
+        scheduler.step()
+
         print(f"Sending the updates to the server for {epoch=}")
-        final_params = {
-            name: param.clone().detach() for name, param in model.named_parameters()
-        }
 
-        grads = [
-            serialize_tensor(final_params[name] - initial_params[name])
-            for name in initial_params
-        ]
-        req = UpdateRequest(gradients=grads, rank=rank, epoch=epoch)
-        if sync:
-            resp = ps.SyncUpdate(req)
+        if streaming:
+            metadata = (("rank", str(rank)), ("epoch", str(epoch)))
+            resp_iter: Iterable[TensorChunk] = ps.StreamingSyncUpdate(
+                tensor_stream(initial_params, initial_buffers, model),
+                metadata=metadata,
+            )
+
+            params_and_bufs = chain(model.parameters(), model.buffers())
+            chunks: list[TensorChunk] = []
+            for chunk in resp_iter:
+                chunks.append(chunk)
+                if chunk.is_last:
+                    tensor = chunks_to_tensor(chunks)
+                    with torch.no_grad():
+                        next(params_and_bufs).copy_(tensor)
+                    chunks.clear()
         else:
-            resp = ps.AsyncUpdate(req)
-
-        with torch.no_grad():
-            for curr_param, updated_param in zip(model.parameters(), resp.parameters):
-                curr_param.copy_(deserialize_tensor(updated_param))
+            raise NotImplementedError()
 
         torch.save(
             model.state_dict(),
@@ -116,3 +125,15 @@ def worker(
     )
     # NOTE: Maybe add validation
     print("Done")
+
+
+def tensor_stream(
+    initial_params: list[torch.Tensor],
+    initial_buffers: list[torch.Tensor],
+    model: torch.nn.Module,
+) -> Iterable[TensorChunk]:
+    for new_param, initial_param in zip(model.parameters(), initial_params):
+        yield from tensor_to_chunks(new_param - initial_param)
+
+    for new_buffer, initial_buffer in zip(model.buffers(), initial_buffers):
+        yield from tensor_to_chunks(new_buffer - initial_buffer)
