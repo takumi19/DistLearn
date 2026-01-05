@@ -10,16 +10,12 @@ import proto.ps_pb2_grpc as ps_grpc
 import torch
 from helpers import (
     chunks_to_tensor,
-    deserialize_tensor,
-    serialize_tensor,
     tensor_to_chunks,
 )
 from proto.ps_pb2 import (
     GetStartTimeArgs,
     GetStartTimeReply,
     TensorChunk,
-    UpdateRequest,
-    UpdateResponse,
 )
 from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader
@@ -109,35 +105,35 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
         print(f"S[{rank}] receiving chunks")
         yield from self._chunk_stream()
 
-    def AsyncUpdate(self, request: UpdateRequest, context: grpc.ServicerContext):
-        grads = [
-            deserialize_tensor(tensor_proto) / (self.world_size - 1)
-            for tensor_proto in request.gradients
-        ]
-
-        with self.lock:
-            self.req_cnt = (self.req_cnt + 1) % (self.world_size - 1)
-            with torch.no_grad():
-                for p, g in zip(self.model.parameters(), grads):
-                    new_param = p + g
-                    p.copy_(new_param)
-
-            if self.req_cnt == 0:
-                thr = threading.Thread(
-                    name=f"Validation-{request.epoch}", target=self._run_validation
-                )
-                thr.start()
-            return self._make_update_response()
+    # def AsyncUpdate(self, request_iterator: UpdateRequest, context: grpc.ServicerContext):
+    #     grads = [
+    #         deserialize_tensor(tensor_proto) / (self.world_size - 1)
+    #         for tensor_proto in request.gradients
+    #     ]
+    #
+    #     with self.lock:
+    #         self.req_cnt = (self.req_cnt + 1) % (self.world_size - 1)
+    #         with torch.no_grad():
+    #             for p, g in zip(self.model.parameters(), grads):
+    #                 new_param = p + g
+    #                 p.copy_(new_param)
+    #
+    #         if self.req_cnt == 0:
+    #             thr = threading.Thread(
+    #                 name=f"Validation-{request.epoch}", target=self._run_validation
+    #             )
+    #             thr.start()
+    #         return self._make_update_response()
 
     def GetStartTime(
         self, request: GetStartTimeArgs, context: grpc.ServicerContext
     ) -> GetStartTimeReply:
         return GetStartTimeReply(timestamp=self.start_time)
 
-    def _make_update_response(self) -> UpdateResponse:
-        return UpdateResponse(
-            parameters=[serialize_tensor(p) for p in self.model.parameters()]
-        )
+    # def _make_update_response(self) -> UpdateResponse:
+    #     return UpdateResponse(
+    #         parameters=[serialize_tensor(p) for p in self.model.parameters()]
+    #     )
 
     def _run_validation(self):
         # HACK: Sleep here a little bit so that the lock does not get held before we send back the response to the workers

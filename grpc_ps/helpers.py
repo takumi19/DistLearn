@@ -1,21 +1,9 @@
 import numpy as np
 from typing import Iterable
 import torch
-from proto.ps_pb2 import TensorProto, TensorChunk
+from proto.ps_pb2 import TensorChunk
 
 CHUNK_SIZE_BYTES = 1 * 1024 * 1024
-
-
-def serialize_tensor(t: torch.Tensor) -> TensorProto:
-    with torch.no_grad():
-        array = t.contiguous().numpy()
-        return TensorProto(data=array.tobytes(), dtype=str(array.dtype), shape=t.shape)
-
-
-def deserialize_tensor(tp: TensorProto) -> torch.Tensor:
-    array = np.frombuffer(tp.data, dtype=tp.dtype)
-    tensor = torch.from_numpy(array.copy()).reshape(tuple(tp.shape))
-    return tensor
 
 
 def tensor_to_chunks(

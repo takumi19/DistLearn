@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from itertools import chain
 from typing import Iterable
 
@@ -26,8 +27,10 @@ def worker(
     max_lr=1e-2,
 ):
     start_time = ps.GetStartTime(GetStartTimeArgs()).timestamp
-    os.makedirs(f"model_weights/{start_time}", exist_ok=True)
-    os.makedirs(f"logs/{start_time}", exist_ok=True)
+    snapshots_dir, logs_dir = f"model_weights/{start_time}", f"logs/{start_time}"
+    os.makedirs(snapshots_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
+    print(f"Starting at {start_time}, saving snapshots to {snapshots_dir}, writing logs to {logs_dir}")
 
     epoch_metrics = []
     batch_records = []
@@ -85,21 +88,23 @@ def worker(
 
         print(f"Sending the updates to the server for {epoch=}")
 
-        metadata = (("rank", str(rank)), ("epoch", str(epoch)))
-        resp_iter: Iterable[TensorChunk] = ps.SyncUpdate(
-            tensor_stream(initial_params, initial_buffers, model),
-            metadata=metadata,
-        )
-
-        params_and_bufs = chain(model.parameters(), model.buffers())
-        chunks: list[TensorChunk] = []
-        for chunk in resp_iter:
-            chunks.append(chunk)
-            if chunk.is_last:
-                tensor = chunks_to_tensor(chunks)
-                with torch.no_grad():
-                    next(params_and_bufs).copy_(tensor)
-                chunks.clear()
+        if sync:
+            metadata = (("rank", str(rank)), ("epoch", str(epoch)))
+            resp_iter: Iterable[TensorChunk] = ps.SyncUpdate(
+                tensor_stream(initial_params, initial_buffers, model),
+                metadata=metadata,
+            )
+            params_and_bufs = chain(model.parameters(), model.buffers())
+            chunks: list[TensorChunk] = []
+            for chunk in resp_iter:
+                chunks.append(chunk)
+                if chunk.is_last:
+                    tensor = chunks_to_tensor(chunks)
+                    with torch.no_grad():
+                        next(params_and_bufs).copy_(tensor)
+                    chunks.clear()
+        else:
+            raise NotImplementedError()
 
         torch.save(
             model.state_dict(),
@@ -122,8 +127,7 @@ def worker(
     pd.DataFrame(batch_records).to_csv(
         f"logs/{start_time}/batches_worker_{rank}.csv", index=False
     )
-    # NOTE: Maybe add validation
-    print("Done")
+    print(f"Finished at {str(datetime.now()).split('.', 1)[0].replace(' ', 'T')}")
 
 
 def tensor_stream(
