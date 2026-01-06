@@ -127,12 +127,12 @@ def worker(
             }
         )
 
-    # After training
-    metrics_df = pd.DataFrame(epoch_metrics)
-    metrics_df.to_csv(f"logs/{start_time}/metrics_worker_{rank}.csv", index=False)
-    pd.DataFrame(batch_records).to_csv(
-        f"logs/{start_time}/batches_worker_{rank}.csv", index=False
-    )
+        train_df = pd.DataFrame(epoch_metrics)
+        filename = f"logs/{start_time}/metrics_worker_{rank}.csv"
+        train_df.to_csv(
+            filename, index=False, mode="a", header=not os.path.exists(filename)
+        )
+
     print(f"Finished at {str(datetime.now()).split('.', 1)[0].replace(' ', 'T')}")
 
 
