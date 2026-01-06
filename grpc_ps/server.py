@@ -49,7 +49,7 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
         self, request_iterator: Iterable[TensorChunk], context: grpc.ServicerContext
     ) -> Iterable[TensorChunk]:
         param_updates, rank, epoch = self._get_params(request_iterator, context)
-        print(f"Received updated from {rank=}, for {epoch=}")
+        print(f"S{rank} sent updates for E{epoch}")
 
         with self.lock:
             self.aggregated_grads.append(param_updates)
@@ -58,18 +58,18 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
         # NOTE: this block is not protected by a mutex but it will only be invoked by one worker
         # and only after the other calls are waiting on sync_done.
         if not should_wait:
-            print(f"S[{rank}] updating params")
+            print(f"S{rank} updating params")
             avg_grads = [
                 sum(g[i] for g in self.aggregated_grads) / (self.world_size - 1)
                 for i in range(len(self.aggregated_grads[0]))
             ]
-            print(f"S[{rank}] averaged params")
+            print(f"S{rank} averaged params")
 
-            params_and_bufs = chain(self.model.parameters(), self.model.buffers())
             with torch.no_grad():
+                params_and_bufs = chain(self.model.parameters(), self.model.buffers())
                 for p, g in zip(params_and_bufs, avg_grads):
                     p.copy_(p + g)
-            print(f"S[{rank}] updated params")
+            print(f"S{rank} updated params")
 
             self.aggregated_grads = []
 
@@ -78,24 +78,25 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
             )
             thr.start()
 
-            print(f"S[{rank}] signals done")
+            print(f"S{rank} signals done")
             self.sync_done.set()
         else:
-            print(f"S[{rank}] waiting")
+            print(f"S{rank} waiting")
             self.sync_done.wait()
 
         with self.lock:
             if self.sync_done.is_set():
-                print(f"S[{rank}] clears condvar")
+                print(f"S{rank} clears condvar")
                 self.sync_done.clear()
 
-        print(f"S[{rank}] receiving chunks")
+        print(f"S{rank} receiving chunks")
         yield from self._chunk_stream()
 
     def AsyncUpdate(
         self, request_iterator: Iterable[TensorChunk], context: grpc.ServicerContext
     ) -> Iterable[TensorChunk]:
         param_updates, rank, epoch = self._get_params(request_iterator, context)
+        print(f"S{rank} sent params for E{epoch}")
 
         with self.lock:
             self.req_cnt = (self.req_cnt + 1) % (self.world_size - 1)
@@ -112,7 +113,10 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
                     args=(epoch,),
                 )
                 thr.start()
-        yield from self._chunk_stream()
+
+        with self.lock:
+            print(f"S{rank} receiving updates for E{epoch}")
+            yield from self._chunk_stream()
 
     def GetStartTime(
         self, request: GetStartTimeArgs, context: grpc.ServicerContext
