@@ -30,7 +30,9 @@ def worker(
     snapshots_dir, logs_dir = f"model_weights/{start_time}", f"logs/{start_time}"
     os.makedirs(snapshots_dir, exist_ok=True)
     os.makedirs(logs_dir, exist_ok=True)
-    print(f"Starting at {start_time}, saving snapshots to {snapshots_dir}, writing logs to {logs_dir}")
+    print(
+        f"Starting at {start_time}, saving snapshots to {snapshots_dir}, writing logs to {logs_dir}"
+    )
 
     epoch_metrics = []
     batch_records = []
@@ -46,6 +48,7 @@ def worker(
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr, n_epochs * len(train_loader)
     )
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
     for epoch in range(n_epochs):
         print(f"Epoch {epoch} started")
@@ -80,31 +83,34 @@ def worker(
             loss.backward()
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
 
             if "TEST" in os.environ and os.environ["TEST"] == "1":
                 break
 
-        scheduler.step()
-
         print(f"Sending the updates to the server for {epoch=}")
 
+        metadata = (("rank", str(rank)), ("epoch", str(epoch)))
         if sync:
-            metadata = (("rank", str(rank)), ("epoch", str(epoch)))
             resp_iter: Iterable[TensorChunk] = ps.SyncUpdate(
                 tensor_stream(initial_params, initial_buffers, model),
                 metadata=metadata,
             )
-            params_and_bufs = chain(model.parameters(), model.buffers())
-            chunks: list[TensorChunk] = []
-            for chunk in resp_iter:
-                chunks.append(chunk)
-                if chunk.is_last:
-                    tensor = chunks_to_tensor(chunks)
-                    with torch.no_grad():
-                        next(params_and_bufs).copy_(tensor)
-                    chunks.clear()
         else:
-            raise NotImplementedError()
+            resp_iter: Iterable[TensorChunk] = ps.AsyncUpdate(
+                tensor_stream(initial_params, initial_buffers, model),
+                metadata=metadata,
+            )
+
+        params_and_bufs = chain(model.parameters(), model.buffers())
+        chunks: list[TensorChunk] = []
+        for chunk in resp_iter:
+            chunks.append(chunk)
+            if chunk.is_last:
+                tensor = chunks_to_tensor(chunks)
+                with torch.no_grad():
+                    next(params_and_bufs).copy_(tensor)
+                chunks.clear()
 
         torch.save(
             model.state_dict(),
