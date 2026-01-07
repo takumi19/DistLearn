@@ -40,7 +40,6 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
         self.sync_done = threading.Event()
         self.req_cnt = 0  # For the async function to run validation
         self.aggregated_buffers: list[list[torch.Tensor]] = []
-        self.val_metrics = []
         self.start_time = str(datetime.now()).split(".", 1)[0].replace(" ", "T")
         os.makedirs(f"model_weights/{self.start_time}", exist_ok=True)
         os.makedirs(f"logs/{self.start_time}", exist_ok=True)
@@ -100,10 +99,14 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
 
         with self.lock:
             self.req_cnt = (self.req_cnt + 1) % (self.world_size - 1)
+            avg_updates = [
+                sum(g[i] for g in param_updates) / (self.world_size - 1)
+                for i in range(len(param_updates))
+            ]
 
             with torch.no_grad():
                 params_and_bufs = chain(self.model.parameters(), self.model.buffers())
-                for p, g in zip(params_and_bufs, param_updates):
+                for p, g in zip(params_and_bufs, avg_updates):
                     p.copy_(p + g)
 
             if self.req_cnt == 0:
@@ -162,11 +165,10 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
             acc = 100.0 * correct / output_counter
             f1 = f1_score(y_true, y_prediction, average="weighted")
 
-            print(
-                f"{name} Loss: {loss:.4f}, {name} Accuracy: {acc:.2f}%, {name} F1: {f1:.4f}"
-            )
+            print(f"{name} Loss: {loss:.4f}, Accuracy: {acc:.2f}%, F1: {f1:.4f}")
 
-            self.val_metrics.append(
+            val_metrics = []
+            val_metrics.append(
                 {
                     "epoch": epoch + 1,
                     "loss": loss,
@@ -174,7 +176,7 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
                     "f1": f1,
                 }
             )
-            val_df = pd.DataFrame(self.val_metrics)
+            val_df = pd.DataFrame(val_metrics)
             filename = f"logs/{self.start_time}/validation_metrics.csv"
             val_df.to_csv(
                 filename, index=False, mode="a", header=not os.path.exists(filename)

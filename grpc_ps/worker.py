@@ -34,7 +34,6 @@ def worker(
         f"Starting at {start_time}, saving snapshots to {snapshots_dir}, writing logs to {logs_dir}"
     )
 
-    epoch_metrics = []
     batch_records = []
     device = "cpu"
 
@@ -119,6 +118,7 @@ def worker(
 
         epoch_accuracy = correct / total if total else 0.0
         avg_epoch_loss = epoch_loss / total if total else 0.0
+        epoch_metrics = []
         epoch_metrics.append(
             {
                 "epoch": epoch + 1,
