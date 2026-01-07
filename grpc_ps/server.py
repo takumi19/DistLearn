@@ -141,10 +141,9 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
             loss_counter = 0
             y_true = []
             y_prediction = []
-            batch_records = []
 
             with torch.no_grad():
-                for i, data in enumerate(self.val_loader):
+                for data in self.val_loader:
                     inputs, labels = (
                         data[0].to(self.device, non_blocking=True),
                         data[1].to(self.device, non_blocking=True),
@@ -158,7 +157,6 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
                     output_counter += len(labels)
                     y_prediction.extend(prediction.squeeze().tolist())
                     y_true.extend(labels.tolist())
-                    batch_records.append({"batch": i + 1, "loss": total_loss.item()})
 
             total_loss /= loss_counter
             acc = 100.0 * correct / output_counter
