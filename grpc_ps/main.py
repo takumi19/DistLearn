@@ -100,50 +100,51 @@ def parse_args() -> argparse.Namespace:
 def load_datasets(
     data_dir: str, batch_size: int, rank: int, world_size: int
 ) -> tuple[DataLoader | None, DataLoader, DataLoader | None, DistributedSampler | None]:
-    transform_train = transforms.Compose(
+    transform = transforms.Compose(
         [
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.5071, 0.4865, 0.4409), std=(0.2673, 0.2564, 0.2762)
-            ),
-        ]
-    )
-    transform_val = transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.5071, 0.4865, 0.4409), std=(0.2673, 0.2564, 0.2762)
-            ),
+            transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(2.8),
+            transforms.RandomGrayscale(0.2),
+            transforms.ToTensor(),  # Convert images to Tensor ( Channel X Height X Width)
+            transforms.Normalize((0.4911, 0.4820, 0.4467), (0.2022, 0.1993, 0.2009)),
         ]
     )
 
-    full_train_dataset = datasets.CIFAR100(
-        root=data_dir, train=True, download=False, transform=transform_train
+    train = datasets.CIFAR100(
+        root=data_dir, train=True, download=True, transform=transform
     )
-    train_size = int(0.9 * len(full_train_dataset))
-    val_size = len(full_train_dataset) - train_size
-    train_dataset, val_dataset = random_split(
-        full_train_dataset,
-        [train_size, val_size],
-        generator=torch.Generator(),
+    test = datasets.CIFAR100(
+        root=data_dir, train=False, download=True, transform=transform
     )
-    val_dataset.dataset.transform = transform_val
-    test_dataset = datasets.CIFAR100(
-        root=data_dir, train=False, download=False, transform=transform_val
+    val_ratio = 0.2
+    train_data, val_data = torch.utils.data.random_split(
+        train,
+        [
+            int((1 - val_ratio) * len(train)),
+            int((val_ratio) * len(train)),
+        ],
     )
+    # train_dataset, val_dataset = random_split(
+    #     full_train_dataset,
+    #     [train_size, val_size],
+    #     generator=torch.Generator(),
+    # )
+    # test_dataset = datasets.CIFAR100(
+    #     root=data_dir, train=False, download=False, transform=transform_val
+    # )
 
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False)
     if rank == 0:
         return None, val_loader, None, None
+
     sampler = DistributedSampler(
-        dataset=train_dataset, num_replicas=world_size - 1, rank=rank - 1
+        dataset=train_data, num_replicas=world_size - 1, rank=rank - 1
     )
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, sampler=sampler, shuffle=False
+        train_data, batch_size=batch_size, sampler=sampler, shuffle=False
     )
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test, batch_size=batch_size, shuffle=False)
 
     return train_loader, val_loader, test_loader, sampler
 

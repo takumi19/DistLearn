@@ -135,7 +135,7 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
             name = f"Validation {epoch}"
 
             self.model.eval()
-            loss = 0.0
+            total_loss = 0.0
             correct = 0
             output_counter = 0
             loss_counter = 0
@@ -150,28 +150,27 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
                         data[1].to(self.device, non_blocking=True),
                     )
                     outputs = self.model(inputs)
-                    loss = self.criterion(outputs, labels)
 
-                    loss += loss.item()
+                    total_loss += self.criterion(outputs, labels).item()
                     loss_counter += 1
                     prediction = outputs.argmax(dim=1, keepdim=True)
                     correct += prediction.eq(labels.view_as(prediction)).sum().item()
                     output_counter += len(labels)
                     y_prediction.extend(prediction.squeeze().tolist())
                     y_true.extend(labels.tolist())
-                    batch_records.append({"batch": i + 1, "loss": loss.item()})
+                    batch_records.append({"batch": i + 1, "loss": total_loss.item()})
 
-            loss /= loss_counter
+            total_loss /= loss_counter
             acc = 100.0 * correct / output_counter
             f1 = f1_score(y_true, y_prediction, average="weighted")
 
-            print(f"{name} Loss: {loss:.4f}, Accuracy: {acc:.2f}%, F1: {f1:.4f}")
+            print(f"{name} Loss: {total_loss:.4f}, Accuracy: {acc:.2f}%, F1: {f1:.4f}")
 
             val_metrics = []
             val_metrics.append(
                 {
                     "epoch": epoch + 1,
-                    "loss": loss,
+                    "loss": total_loss,
                     "accuracy": acc / 100.0,
                     "f1": f1,
                 }
