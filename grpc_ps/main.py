@@ -22,6 +22,9 @@ def main():
         args.data_dir, args.batch_size, args.rank, args.world_size
     )
     model = models.resnet18(num_classes=100)
+    model.conv1 = torch.nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    model.maxpool = torch.nn.Identity()
+    model.fc = torch.nn.Linear(512, 100)
     criterion = torch.nn.CrossEntropyLoss()
 
     server_addr = f"{args.master_addr}:{args.master_port}"
