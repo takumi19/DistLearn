@@ -25,6 +25,7 @@ def worker(
     criterion: torch.nn.Module,
     sync: bool = True,
     max_lr=1e-2,
+    weight_decay=5e-4,
 ):
     start_time = ps.GetStartTime(GetStartTimeArgs()).timestamp
     snapshots_dir, logs_dir = f"model_weights/{start_time}", f"logs/{start_time}"
@@ -41,7 +42,7 @@ def worker(
         model.parameters(),
         lr=max_lr,
         momentum=0.9,
-        weight_decay=1e-5,
+        weight_decay=weight_decay,
         nesterov=True,
     )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -111,10 +112,11 @@ def worker(
                     next(params_and_bufs).copy_(tensor)
                 chunks.clear()
 
-        torch.save(
-            model.state_dict(),
-            f"./model_weights/{start_time}/worker-{rank}_epoch-{epoch + 1}.pth",
-        )
+        if epoch % 20 == 0:
+            torch.save(
+                model.state_dict(),
+                f"./model_weights/{start_time}/worker-{rank}_epoch-{epoch + 1}.pth",
+            )
 
         epoch_accuracy = correct / total if total else 0.0
         avg_epoch_loss = epoch_loss / total if total else 0.0

@@ -52,6 +52,7 @@ def main():
                 criterion,
                 args.sync,
                 args.lr,
+                args.weight_decay
             )
 
 
