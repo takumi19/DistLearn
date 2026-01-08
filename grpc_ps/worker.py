@@ -135,6 +135,10 @@ def worker(
             filename, index=False, mode="a", header=not os.path.exists(filename)
         )
 
+    torch.save(
+        model.state_dict(),
+        f"./model_weights/{start_time}/worker-{rank}_final.pth",
+    )
     print(f"Finished at {str(datetime.now()).split('.', 1)[0].replace(' ', 'T')}")
 
 
