@@ -1,3 +1,4 @@
+from datetime import timedelta
 import os
 import torch.distributed as dist
 
@@ -7,6 +8,7 @@ def main():
         init_method="env://",
         rank=int(os.environ["RANK"]),
         world_size=int(os.environ["WORLD_SIZE"]),
+        timeout=timedelta(seconds=50),
     )
 
     rank = dist.get_rank()
