@@ -99,10 +99,7 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
 
         with self.lock:
             self.req_cnt = (self.req_cnt + 1) % (self.world_size - 1)
-            avg_updates = [
-                sum(g[i] for g in param_updates) / (self.world_size - 1)
-                for i in range(len(param_updates))
-            ]
+            avg_updates = [g / (self.world_size - 1) for g in param_updates]
 
             with torch.no_grad():
                 params_and_bufs = chain(self.model.parameters(), self.model.buffers())
