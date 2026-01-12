@@ -117,7 +117,6 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
                 )
                 thr.start()
 
-        with self.lock:
             print(f"S{rank} receiving updates for E{epoch}")
             yield from self._chunk_stream()
 
