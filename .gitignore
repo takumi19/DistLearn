@@ -1,0 +1,5 @@
+logs*/
+model_weights/
+cifar10/
+data/
+__pychache__/
