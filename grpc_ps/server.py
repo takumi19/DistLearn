@@ -1,3 +1,4 @@
+from copy import deepcopy
 import os
 import threading
 import time
@@ -73,7 +74,9 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
             self.aggregated_grads = []
 
             thr = threading.Thread(
-                name=f"Validation-{epoch}", target=self._run_validation, args=(epoch,)
+                name=f"Validation-{epoch}",
+                target=self._run_validation,
+                args=(epoch, self.model),
             )
             thr.start()
 
@@ -89,7 +92,7 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
                 self.sync_done.clear()
 
         print(f"S{rank} receiving chunks")
-        yield from self._chunk_stream()
+        yield from self._chunk_stream(self.model)
 
     def AsyncUpdate(
         self, request_iterator: Iterable[TensorChunk], context: grpc.ServicerContext
@@ -97,6 +100,7 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
         param_updates, rank, epoch = self._get_params(request_iterator, context)
         print(f"S{rank} sent params for E{epoch}")
 
+        model_copy = None
         with self.lock:
             self.req_cnt = (self.req_cnt + 1) % (self.world_size - 1)
             avg_updates = [g / (self.world_size - 1) for g in param_updates]
@@ -105,77 +109,74 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
                 params_and_bufs = chain(self.model.parameters(), self.model.buffers())
                 for p, g in zip(params_and_bufs, avg_updates):
                     p.copy_(p + g)
+                model_copy = deepcopy(self.model)
 
             if self.req_cnt == 0:
                 thr = threading.Thread(
                     name=f"Validation-{epoch}",
                     target=self._run_validation,
-                    args=(epoch,),
+                    args=(epoch, model_copy),
                 )
                 thr.start()
 
-            print(f"S{rank} receiving updates for E{epoch}")
-            yield from self._chunk_stream()
+        print(f"S{rank} receiving updates for E{epoch}")
+        yield from self._chunk_stream(model_copy)
 
     def GetStartTime(
         self, request: GetStartTimeArgs, context: grpc.ServicerContext
     ) -> GetStartTimeReply:
         return GetStartTimeReply(timestamp=self.start_time)
 
-    def _run_validation(self, epoch: int):
+    def _run_validation(self, epoch: int, model: torch.nn.Module):
         # HACK: Sleep here a little bit so that the lock does not get held before we send back the response to the workers
         time.sleep(3)
-        with self.lock:
-            print("Running validation...")
-            was_training = self.model.training
-            name = f"Validation {epoch}"
+        print("Running validation...")
+        name = f"Validation {epoch}"
 
-            self.model.eval()
-            total_loss = 0.0
-            correct = 0
-            output_counter = 0
-            loss_counter = 0
-            y_true = []
-            y_prediction = []
+        model.eval()
+        total_loss = 0.0
+        correct = 0
+        output_counter = 0
+        loss_counter = 0
+        y_true = []
+        y_prediction = []
 
-            with torch.no_grad():
-                for data in self.val_loader:
-                    inputs, labels = (
-                        data[0].to(self.device, non_blocking=True),
-                        data[1].to(self.device, non_blocking=True),
-                    )
-                    outputs = self.model(inputs)
+        with torch.no_grad():
+            for data in self.val_loader:
+                inputs, labels = (
+                    data[0].to(self.device, non_blocking=True),
+                    data[1].to(self.device, non_blocking=True),
+                )
+                outputs = model(inputs)
 
-                    total_loss += self.criterion(outputs, labels).item()
-                    loss_counter += 1
-                    prediction = outputs.argmax(dim=1, keepdim=True)
-                    correct += prediction.eq(labels.view_as(prediction)).sum().item()
-                    output_counter += len(labels)
-                    y_prediction.extend(prediction.squeeze().tolist())
-                    y_true.extend(labels.tolist())
+                total_loss += self.criterion(outputs, labels).item()
+                loss_counter += 1
+                prediction = outputs.argmax(dim=1, keepdim=True)
+                correct += prediction.eq(labels.view_as(prediction)).sum().item()
+                output_counter += len(labels)
+                y_prediction.extend(prediction.squeeze().tolist())
+                y_true.extend(labels.tolist())
 
-            total_loss /= loss_counter
-            acc = 100.0 * correct / output_counter
-            f1 = f1_score(y_true, y_prediction, average="weighted")
+        total_loss /= loss_counter
+        acc = 100.0 * correct / output_counter
+        f1 = f1_score(y_true, y_prediction, average="weighted")
 
-            print(f"{name} Loss: {total_loss:.4f}, Accuracy: {acc:.2f}%, F1: {f1:.4f}")
+        print(f"{name} Loss: {total_loss:.4f}, Accuracy: {acc:.2f}%, F1: {f1:.4f}")
 
-            val_metrics = []
-            val_metrics.append(
-                {
-                    "epoch": epoch + 1,
-                    "loss": total_loss,
-                    "accuracy": acc / 100.0,
-                    "f1": f1,
-                }
-            )
-            val_df = pd.DataFrame(val_metrics)
-            filename = f"logs/{self.start_time}/validation_metrics.csv"
-            val_df.to_csv(
-                filename, index=False, mode="a", header=not os.path.exists(filename)
-            )
-
-            self.model.train(was_training)
+        val_metrics = []
+        val_metrics.append(
+            {
+                "epoch": epoch + 1,
+                "loss": total_loss,
+                "accuracy": acc / 100.0,
+                "f1": f1,
+            }
+        )
+        val_df = pd.DataFrame(val_metrics)
+        filename = f"logs/{self.start_time}/validation_metrics.csv"
+        val_df.to_csv(
+            filename, index=False, mode="a", header=not os.path.exists(filename)
+        )
 
     def _get_params(
         self, request_iterator: Iterable[TensorChunk], context: grpc.ServicerContext
@@ -198,9 +199,9 @@ class ParameterServerServicer(ps_grpc.ParameterServerServicer):
 
         return param_updates, rank, epoch
 
-    def _chunk_stream(self):
-        for p in self.model.parameters():
+    def _chunk_stream(self, model: torch.nn.Module):
+        for p in model.parameters():
             yield from tensor_to_chunks(p)
 
-        for p in self.model.buffers():
+        for p in model.buffers():
             yield from tensor_to_chunks(p)
