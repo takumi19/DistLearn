@@ -1,0 +1,55 @@
+algorithm: gossip
+async:
+  enabled: true
+  max_staleness: 2
+  mixing_alpha: 0.7
+  push_interval_steps: 1
+dataset:
+  cache_dir: ./Decentr_my_own/artifacts/node-2/cache
+  distributed_eval: false
+  fake_test_size: 96
+  fake_train_size: 384
+  fake_val_size: 96
+  image_size: 32
+  manifest_path: ./Decentr_my_own/artifacts/node-2/manifest.json
+  max_cache_bytes: 268435456
+  min_local_shards: 1
+  name: FakeData
+  num_workers: 0
+  partitioning: homogeneous
+  prefetch_shards: 1
+  rebalance_window_batches: 2
+  root: ./Decentr_my_own/data
+  scheduler_mode: adaptive
+  shard_samples: 32
+  shuffle_scope: round_seeded
+  storage_mode: micro_shards
+  throughput_ema: 0.9
+  transfer_chunk_bytes: 1048576
+  transfer_policy: pull
+  warmup_windows: 1
+device_preference:
+- cpu
+logging:
+  checkpoint_dir: ./Decentr_my_own/artifacts/checkpoints
+  log_dir: ./Decentr_my_own/artifacts/logs
+  metrics_format: csv
+  save_every_round: 1
+mode: async
+model:
+  name: resnet18
+  normalization: groupnorm
+  num_classes: 10
+optimization:
+  batch_size: 32
+  epochs: 4
+  eval_every_epochs: 1
+  local_steps: 4
+  lr: 0.03
+  momentum: 0.9
+  weight_decay: 0.0005
+seed: 42
+sync:
+  averaging: deltas
+  barrier_timeout_s: 120
+  enabled: false

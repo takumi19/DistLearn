@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decentr-my-own"
+version = "0.1.0"
+description = "Decentralized distributed training playground for heterogeneous nodes."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.12,<3",
+  "PyYAML>=6.0,<7",
+  "protobuf>=5,<7",
+  "grpcio>=1.76,<2",
+  "torch>=2.9,<3",
+  "torchvision>=0.24,<0.25",
+]
+
+[project.optional-dependencies]
+dev = [
+  "grpcio-tools>=1.76,<2",
+  "pytest>=8.0,<9",
+]
+
+[project.scripts]
+decentr-my-own = "decentr_my_own.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["decentr_my_own*"]

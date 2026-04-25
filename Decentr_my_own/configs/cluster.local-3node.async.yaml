@@ -1,0 +1,39 @@
+cluster_name: decentr-local-3node-async
+transport: grpc
+overlay_network: none
+tls_enabled: false
+bootstrap_node_id: node-1
+nodes:
+  - id: node-1
+    host: 127.0.0.1
+    bind_host: 127.0.0.1
+    port: 55051
+    platform: macos
+    neighbors: [node-2, node-3]
+    weight: 1.0
+    resources:
+      cpu_cores: 4
+      accelerator: cpu
+      relative_speed: 1.0
+  - id: node-2
+    host: 127.0.0.1
+    bind_host: 127.0.0.1
+    port: 55052
+    platform: macos
+    neighbors: [node-1, node-3]
+    weight: 1.0
+    resources:
+      cpu_cores: 4
+      accelerator: cpu
+      relative_speed: 1.0
+  - id: node-3
+    host: 127.0.0.1
+    bind_host: 127.0.0.1
+    port: 55053
+    platform: macos
+    neighbors: [node-1, node-2]
+    weight: 1.0
+    resources:
+      cpu_cores: 4
+      accelerator: cpu
+      relative_speed: 1.0

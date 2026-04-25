@@ -1,0 +1,43 @@
+seed: 7
+algorithm: local_sgd
+mode: sync
+device_preference: [cuda, mps, cpu]
+model:
+  name: resnet18
+  num_classes: 10
+  normalization: groupnorm
+dataset:
+  name: FakeData
+  root: ./data
+  storage_mode: replicated
+  partitioning: homogeneous
+  shuffle_scope: global_seeded
+  val_split: 0.1
+  num_workers: 0
+  download: false
+  image_size: 32
+  fake_train_size: 96
+  fake_val_size: 32
+  fake_test_size: 32
+optimization:
+  epochs: 2
+  local_steps: 10
+  batch_size: 16
+  lr: 0.02
+  momentum: 0.9
+  weight_decay: 0.0005
+  eval_every_epochs: 1
+sync:
+  enabled: true
+  averaging: deltas
+  barrier_timeout_s: 120
+async:
+  enabled: false
+  push_interval_steps: 10
+  max_staleness: 2
+  mixing_alpha: 0.5
+logging:
+  log_dir: ./Decentr_my_own/artifacts/logs
+  checkpoint_dir: ./Decentr_my_own/artifacts/checkpoints
+  save_every_round: 1
+  metrics_format: csv

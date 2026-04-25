@@ -1,0 +1,35 @@
+seed: 42
+algorithm: gossip
+mode: async
+device_preference: [cuda, mps, cpu]
+model:
+  name: resnet18
+  num_classes: 100
+  normalization: groupnorm
+dataset:
+  name: CIFAR100
+  root: ./data
+  storage_mode: replicated
+  partitioning: heterogeneous
+  shuffle_scope: round_seeded
+optimization:
+  epochs: 20
+  local_steps: 25
+  batch_size: 64
+  lr: 0.03
+  momentum: 0.9
+  weight_decay: 0.0005
+sync:
+  enabled: false
+  averaging: deltas
+  barrier_timeout_s: 120
+async:
+  enabled: true
+  push_interval_steps: 10
+  max_staleness: 4
+  mixing_alpha: 0.5
+logging:
+  log_dir: ./artifacts/logs
+  checkpoint_dir: ./artifacts/checkpoints
+  save_every_round: 1
+  metrics_format: csv

@@ -1,0 +1,39 @@
+cluster_name: decentr-lab
+transport: grpc
+overlay_network: tailscale
+tls_enabled: false
+bootstrap_node_id: node-1
+nodes:
+  - id: node-1
+    host: node-1.tailnet.ts.net
+    bind_host: 0.0.0.0
+    port: 50051
+    platform: macos
+    neighbors: [node-2, node-3]
+    weight: 1.0
+    resources:
+      cpu_cores: 8
+      accelerator: mps
+      relative_speed: 1.0
+  - id: node-2
+    host: node-2.tailnet.ts.net
+    bind_host: 0.0.0.0
+    port: 50051
+    platform: windows
+    neighbors: [node-1, node-3]
+    weight: 1.2
+    resources:
+      cpu_cores: 16
+      accelerator: cuda
+      relative_speed: 1.8
+  - id: node-3
+    host: node-3.tailnet.ts.net
+    bind_host: 0.0.0.0
+    port: 50051
+    platform: macos
+    neighbors: [node-1, node-2]
+    weight: 0.8
+    resources:
+      cpu_cores: 8
+      accelerator: cpu
+      relative_speed: 0.7

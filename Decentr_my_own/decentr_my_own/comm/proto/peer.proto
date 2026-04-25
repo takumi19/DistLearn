@@ -1,0 +1,164 @@
+syntax = "proto3";
+
+message PingRequest {
+  string sender_node_id = 1;
+}
+
+message PingReply {
+  string receiver_node_id = 1;
+  string message = 2;
+}
+
+message ManifestRequest {}
+
+message SplitSummary {
+  string split = 1;
+  int64 sample_count = 2;
+  int64 shard_count = 3;
+}
+
+message ShardMeta {
+  string shard_id = 1;
+  string split = 2;
+  string relative_path = 3;
+  int64 sample_count = 4;
+  int64 byte_size = 5;
+  string sha256 = 6;
+}
+
+message ManifestSnapshot {
+  int64 format_version = 1;
+  string dataset_name = 2;
+  string storage_mode = 3;
+  int64 seed = 4;
+  int64 shard_samples = 5;
+  int64 num_classes = 6;
+  repeated int64 image_shape = 7;
+  repeated SplitSummary splits = 8;
+  repeated ShardMeta shards = 9;
+}
+
+message ManifestReply {
+  string receiver_node_id = 1;
+  ManifestSnapshot manifest = 2;
+}
+
+message LocalShardsRequest {}
+
+message LocalShardsReply {
+  string receiver_node_id = 1;
+  repeated ShardMeta shards = 2;
+}
+
+message PullShardRequest {
+  string shard_id = 1;
+}
+
+message ShardChunk {
+  string shard_id = 1;
+  int64 offset = 2;
+  bytes data = 3;
+  bool eof = 4;
+}
+
+message ThroughputReport {
+  string node_id = 1;
+  int64 window_id = 2;
+  int64 samples_processed = 3;
+  double window_seconds = 4;
+  double effective_throughput = 5;
+  repeated string local_inventory = 6;
+}
+
+message ReportThroughputReply {
+  string receiver_node_id = 1;
+  string node_id = 2;
+  int64 window_id = 3;
+}
+
+message LeaseAssignment {
+  string node_id = 1;
+  repeated string shard_ids = 2;
+}
+
+message LeasePlan {
+  int64 window_id = 1;
+  repeated LeaseAssignment assignments = 2;
+}
+
+message LeasePlanRequest {
+  int64 window_id = 1;
+}
+
+message LeasePlanReply {
+  string receiver_node_id = 1;
+  LeasePlan lease_plan = 2;
+}
+
+message PayloadHeader {
+  string sender_node_id = 1;
+  string payload_id = 2;
+  string payload_kind = 3;
+  int64 model_version = 4;
+  int64 step = 5;
+  int64 sample_count = 6;
+  repeated string tensor_names = 7;
+}
+
+message TensorChunk {
+  int32 tensor_index = 1;
+  bytes data = 2;
+  string dtype = 3;
+  repeated int64 shape = 4;
+  bool is_last_chunk = 5;
+}
+
+message PayloadMessage {
+  oneof item {
+    PayloadHeader header = 1;
+    TensorChunk tensor_chunk = 2;
+  }
+}
+
+message PushPayloadReply {
+  string receiver_node_id = 1;
+  string sender_node_id = 2;
+  string payload_id = 3;
+  int64 tensor_count = 4;
+  int64 num_bytes = 5;
+  string digest = 6;
+}
+
+message PeerStateRequest {}
+
+message StoredPayloadSummary {
+  string receiver_node_id = 1;
+  string sender_node_id = 2;
+  string payload_id = 3;
+  string payload_kind = 4;
+  int64 model_version = 5;
+  int64 step = 6;
+  int64 sample_count = 7;
+  int64 tensor_count = 8;
+  int64 num_bytes = 9;
+  string digest = 10;
+  string received_at = 11;
+  repeated string tensor_names = 12;
+}
+
+message PeerStateReply {
+  string receiver_node_id = 1;
+  int64 received_payload_count = 2;
+  repeated StoredPayloadSummary payloads = 3;
+}
+
+service PeerTransport {
+  rpc Ping(PingRequest) returns (PingReply) {}
+  rpc GetManifest(ManifestRequest) returns (ManifestReply) {}
+  rpc ListLocalShards(LocalShardsRequest) returns (LocalShardsReply) {}
+  rpc PullShard(PullShardRequest) returns (stream ShardChunk) {}
+  rpc ReportThroughput(ThroughputReport) returns (ReportThroughputReply) {}
+  rpc GetLeasePlan(LeasePlanRequest) returns (LeasePlanReply) {}
+  rpc PushPayload(stream PayloadMessage) returns (PushPayloadReply) {}
+  rpc GetPeerState(PeerStateRequest) returns (PeerStateReply) {}
+}
