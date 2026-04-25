@@ -554,6 +554,7 @@ def _train_for_steps(
     confusion = init_confusion_matrix(num_classes)
 
     for inputs, targets in loader:
+        targets_cpu = targets.detach().to("cpu", dtype=torch.int64).reshape(-1)
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
@@ -563,10 +564,12 @@ def _train_for_steps(
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * targets.size(0)
-        correct += (logits.argmax(dim=1) == targets).sum().item()
-        total += targets.size(0)
-        update_confusion_matrix(confusion, logits, targets)
+        batch_size = targets_cpu.numel()
+        total_loss += loss.item() * batch_size
+        preds_cpu = logits.argmax(dim=1).detach().to("cpu", dtype=torch.int64).reshape(-1)
+        correct += (preds_cpu == targets_cpu).sum().item()
+        total += batch_size
+        update_confusion_matrix(confusion, logits, targets_cpu)
         processed_batches += 1
 
         if processed_batches >= max_batches:
@@ -598,15 +601,18 @@ def _evaluate(
     confusion = init_confusion_matrix(num_classes)
 
     for inputs, targets in loader:
+        targets_cpu = targets.detach().to("cpu", dtype=torch.int64).reshape(-1)
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         logits = model(inputs)
         loss = criterion(logits, targets)
 
-        total_loss += loss.item() * targets.size(0)
-        correct += (logits.argmax(dim=1) == targets).sum().item()
-        total += targets.size(0)
-        update_confusion_matrix(confusion, logits, targets)
+        batch_size = targets_cpu.numel()
+        total_loss += loss.item() * batch_size
+        preds_cpu = logits.argmax(dim=1).detach().to("cpu", dtype=torch.int64).reshape(-1)
+        correct += (preds_cpu == targets_cpu).sum().item()
+        total += batch_size
+        update_confusion_matrix(confusion, logits, targets_cpu)
         processed_batches += 1
 
         if max_batches is not None and processed_batches >= max_batches:

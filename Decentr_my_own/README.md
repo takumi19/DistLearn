@@ -21,6 +21,7 @@
 
 - `PROJECT_GUIDE.md`
 - `MULTI_HOST_RUNBOOK.md`
+- `RUNBOOK.ru.md`
 
 ## Установка
 
