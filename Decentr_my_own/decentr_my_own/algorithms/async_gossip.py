@@ -44,6 +44,7 @@ from decentr_my_own.training.state_ops import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_MAX_PUSH_ATTEMPT_TIMEOUT_S = 30.0
 
 
 @dataclass
@@ -168,7 +169,7 @@ def run_async_worker(
                 push_interval_steps=config.async_config.push_interval_steps,
                 base_alpha=config.async_config.mixing_alpha,
                 max_staleness=config.async_config.max_staleness,
-                transport_timeout_s=min(1.0, overrides.transport_timeout_s),
+                transport_timeout_s=overrides.transport_timeout_s,
                 last_mixed_payload_ids=last_mixed_payload_ids,
             )
             local_step = train_metrics["last_step"]
@@ -485,7 +486,13 @@ def _push_payload_best_effort(
     while time.time() < deadline:
         client = PeerClient(target)
         try:
-            client.push_payload(payload, timeout_s=min(2.0, max(0.5, deadline - time.time())))
+            remaining_s = deadline - time.time()
+            if remaining_s <= 0:
+                break
+            client.push_payload(
+                payload,
+                timeout_s=min(_MAX_PUSH_ATTEMPT_TIMEOUT_S, max(0.5, remaining_s)),
+            )
             return True
         except Exception:
             time.sleep(0.1)
