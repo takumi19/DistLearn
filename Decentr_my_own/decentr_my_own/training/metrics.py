@@ -15,8 +15,21 @@ def update_confusion_matrix(
     targets: torch.Tensor,
 ) -> None:
     num_classes = confusion.size(0)
-    preds = logits.argmax(dim=1).detach().to("cpu", dtype=torch.int64)
-    targets_cpu = targets.detach().to("cpu", dtype=torch.int64)
+    preds = logits.argmax(dim=1).detach().to("cpu", dtype=torch.int64).reshape(-1)
+    targets_cpu = targets.detach().to("cpu", dtype=torch.int64).reshape(-1)
+    if preds.numel() != targets_cpu.numel():
+        raise ValueError(
+            "Predictions and targets must contain the same number of elements "
+            f"(got {preds.numel()} and {targets_cpu.numel()})"
+        )
+    if targets_cpu.numel() == 0:
+        return
+    if torch.any(targets_cpu < 0) or torch.any(targets_cpu >= num_classes):
+        invalid = targets_cpu[(targets_cpu < 0) | (targets_cpu >= num_classes)]
+        raise ValueError(
+            "Targets contain class ids outside the configured range: "
+            f"{invalid.tolist()[:8]}"
+        )
     bincount = torch.bincount(
         targets_cpu * num_classes + preds,
         minlength=num_classes * num_classes,
