@@ -130,6 +130,12 @@ def aggregate_node_summaries(
     mixed_peer_updates = []
     max_staleness = []
     failed_pushes = []
+    push_counts = []
+    received_payload_counts = []
+    cluster_node_counts = []
+    epoch_counts = []
+    completion_reported = []
+    completion_cluster_complete = []
 
     for item in summaries:
         final_metrics = item.get("final_test_metrics", {})
@@ -155,6 +161,18 @@ def aggregate_node_summaries(
             max_staleness.append(_int_or_none(item.get("max_observed_staleness")))
         if item.get("failed_pushes_total") is not None:
             failed_pushes.append(_int_or_none(item.get("failed_pushes_total")))
+        if item.get("push_count_total") is not None:
+            push_counts.append(_int_or_none(item.get("push_count_total")))
+        if item.get("received_payload_count") is not None:
+            received_payload_counts.append(_int_or_none(item.get("received_payload_count")))
+        if item.get("cluster_node_count") is not None:
+            cluster_node_counts.append(_int_or_none(item.get("cluster_node_count")))
+        if item.get("epoch_count") is not None:
+            epoch_counts.append(_int_or_none(item.get("epoch_count")))
+        if item.get("completion_reported") is not None:
+            completion_reported.append(bool(item.get("completion_reported")))
+        if item.get("completion_cluster_complete") is not None:
+            completion_cluster_complete.append(bool(item.get("completion_cluster_complete")))
 
         node_rows.append(
             {
@@ -173,10 +191,19 @@ def aggregate_node_summaries(
         )
 
     unique_digests = {digest for digest in state_digests if digest}
+    expected_node_count = None
+    if cluster_node_counts:
+        unique_cluster_counts = {value for value in cluster_node_counts if value is not None}
+        if len(unique_cluster_counts) == 1:
+            expected_node_count = next(iter(unique_cluster_counts))
     report = {
         "run_id": run_id or summaries[0].get("run_id"),
         "cluster_names": sorted({item.get("cluster_name") for item in summaries if item.get("cluster_name")}),
         "node_count": len(summaries),
+        "expected_node_count": expected_node_count,
+        "complete_cluster_summary": expected_node_count == len(summaries)
+        if expected_node_count is not None
+        else None,
         "modes": sorted({item.get("mode") for item in summaries if item.get("mode")}),
         "algorithms": sorted(
             {item.get("algorithm") for item in summaries if item.get("algorithm")}
@@ -199,6 +226,9 @@ def aggregate_node_summaries(
         "best_val_accuracy_mean": _mean(best_val_acc),
         "best_val_accuracy_max": _max(best_val_acc),
         "consistent_final_state": len(unique_digests) == 1 and len(unique_digests) > 0,
+        "epoch_count_consistent": len({value for value in epoch_counts if value is not None}) <= 1
+        if epoch_counts
+        else None,
         "nodes": sorted(node_rows, key=lambda item: item["self_node_id"] or ""),
     }
     if mixed_peer_updates:
@@ -213,6 +243,18 @@ def aggregate_node_summaries(
         report["failed_pushes_total_sum"] = int(
             sum(value for value in failed_pushes if value is not None)
         )
+    if push_counts:
+        report["push_count_total_sum"] = int(
+            sum(value for value in push_counts if value is not None)
+        )
+    if received_payload_counts:
+        report["received_payload_count_sum"] = int(
+            sum(value for value in received_payload_counts if value is not None)
+        )
+    if completion_reported:
+        report["all_nodes_reported_completion"] = all(completion_reported)
+    if completion_cluster_complete:
+        report["bootstrap_observed_full_completion"] = any(completion_cluster_complete)
     return report
 
 

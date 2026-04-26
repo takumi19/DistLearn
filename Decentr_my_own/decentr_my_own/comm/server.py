@@ -8,6 +8,8 @@ import grpc
 from decentr_my_own.comm.rpc_conversion import (
     lease_plan_to_proto,
     manifest_to_proto,
+    run_completion_from_proto,
+    run_completion_to_proto,
     shard_meta_to_proto,
     throughput_report_from_proto,
 )
@@ -27,6 +29,7 @@ GRPC_OPTIONS = [
     ("grpc.max_send_message_length", -1),
     ("grpc.max_receive_message_length", -1),
 ]
+GRPC_COMPRESSION = grpc.Compression.Gzip
 
 
 class PeerTransportServicer(peer_pb2_grpc.PeerTransportServicer):
@@ -106,6 +109,23 @@ class PeerTransportServicer(peer_pb2_grpc.PeerTransportServicer):
             lease_plan=lease_plan_to_proto(lease_plan),
         )
 
+    def ReportRunCompletion(self, request, context):
+        completion = run_completion_from_proto(request)
+        stored = self.control_store.store_run_completion(completion)
+        return peer_pb2.ReportRunCompletionReply(
+            receiver_node_id=self.node_id,
+            node_id=stored.node_id,
+        )
+
+    def GetRunCompletions(self, request, context):
+        return peer_pb2.RunCompletionsReply(
+            receiver_node_id=self.node_id,
+            completions=[
+                run_completion_to_proto(item)
+                for item in self.control_store.get_run_completions()
+            ],
+        )
+
     def PushPayload(self, request_iterator, context):
         payload, num_bytes, digest = messages_to_payload(request_iterator)
         summary = self.state_store.store(payload, num_bytes=num_bytes, digest=digest)
@@ -162,6 +182,7 @@ class PeerServer:
         self._server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=max_workers),
             options=GRPC_OPTIONS,
+            compression=GRPC_COMPRESSION,
         )
         peer_pb2_grpc.add_PeerTransportServicer_to_server(
             self.servicer,
@@ -233,11 +254,23 @@ class PeerServer:
             timeout_s=timeout_s,
         )
 
+    def store_run_completion(self, completion) -> None:
+        self.control_store.store_run_completion(completion)
+
+    def get_run_completions(self):
+        return self.control_store.get_run_completions()
+
+    def wait_for_run_completions(self, *, node_ids: list[str], timeout_s: float) -> bool:
+        return self.control_store.wait_for_run_completions(
+            node_ids=node_ids,
+            timeout_s=timeout_s,
+        )
+
 
 def _snapshot_to_reply(snapshot: PeerStateSnapshot) -> peer_pb2.PeerStateReply:
     return peer_pb2.PeerStateReply(
         receiver_node_id=snapshot.node_id,
-        received_payload_count=len(snapshot.payloads),
+        received_payload_count=snapshot.received_payload_count,
         payloads=[
             peer_pb2.StoredPayloadSummary(
                 receiver_node_id=item.receiver_node_id,

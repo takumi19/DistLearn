@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from decentr_my_own.comm.proto import peer_pb2
 from decentr_my_own.data.manifest import DatasetManifest, ShardMeta, SplitSummary
-from decentr_my_own.data.scheduler_state import LeasePlanRecord, ThroughputReportRecord
+from decentr_my_own.data.scheduler_state import (
+    LeasePlanRecord,
+    RunCompletionRecord,
+    ThroughputReportRecord,
+)
 
 
 def manifest_to_proto(manifest: DatasetManifest) -> peer_pb2.ManifestSnapshot:
@@ -94,6 +98,9 @@ def throughput_report_from_proto(message: peer_pb2.ThroughputReport) -> Throughp
 def lease_plan_to_proto(plan: LeasePlanRecord) -> peer_pb2.LeasePlan:
     return peer_pb2.LeasePlan(
         window_id=plan.window_id,
+        epoch_id=plan.epoch_id,
+        epoch_window_index=plan.epoch_window_index,
+        epoch_window_count=plan.epoch_window_count,
         assignments=[
             peer_pb2.LeaseAssignment(node_id=node_id, shard_ids=list(shard_ids))
             for node_id, shard_ids in sorted(plan.assignments.items())
@@ -104,7 +111,30 @@ def lease_plan_to_proto(plan: LeasePlanRecord) -> peer_pb2.LeasePlan:
 def lease_plan_from_proto(message: peer_pb2.LeasePlan) -> LeasePlanRecord:
     return LeasePlanRecord(
         window_id=message.window_id,
+        epoch_id=message.epoch_id,
+        epoch_window_index=message.epoch_window_index,
+        epoch_window_count=message.epoch_window_count or 1,
         assignments={
             item.node_id: tuple(item.shard_ids) for item in message.assignments
         },
+    )
+
+
+def run_completion_to_proto(record: RunCompletionRecord) -> peer_pb2.RunCompletion:
+    return peer_pb2.RunCompletion(
+        node_id=record.node_id,
+        last_window_id=record.last_window_id,
+        total_samples_processed=record.total_samples_processed,
+        final_state_digest=record.final_state_digest or "",
+        completed_at=record.completed_at or "",
+    )
+
+
+def run_completion_from_proto(message: peer_pb2.RunCompletion) -> RunCompletionRecord:
+    return RunCompletionRecord(
+        node_id=message.node_id,
+        last_window_id=message.last_window_id,
+        total_samples_processed=message.total_samples_processed,
+        final_state_digest=message.final_state_digest or None,
+        completed_at=message.completed_at or None,
     )

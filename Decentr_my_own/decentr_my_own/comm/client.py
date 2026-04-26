@@ -8,15 +8,21 @@ import grpc
 from decentr_my_own.comm.rpc_conversion import (
     lease_plan_from_proto,
     manifest_from_proto,
+    run_completion_from_proto,
+    run_completion_to_proto,
     shard_meta_from_proto,
     throughput_report_to_proto,
 )
 from decentr_my_own.comm.messages import PeerPayload
 from decentr_my_own.comm.proto import peer_pb2, peer_pb2_grpc
 from decentr_my_own.comm.serialization import payload_to_messages
-from decentr_my_own.comm.server import GRPC_OPTIONS
+from decentr_my_own.comm.server import GRPC_COMPRESSION, GRPC_OPTIONS
 from decentr_my_own.data.manifest import DatasetManifest, ShardMeta
-from decentr_my_own.data.scheduler_state import LeasePlanRecord, ThroughputReportRecord
+from decentr_my_own.data.scheduler_state import (
+    LeasePlanRecord,
+    RunCompletionRecord,
+    ThroughputReportRecord,
+)
 from decentr_my_own.data.shard_transfer import PulledShardResult, write_pulled_shard
 
 
@@ -43,7 +49,11 @@ class PushResult:
 class PeerClient:
     def __init__(self, target: str):
         self.target = target
-        self.channel = grpc.insecure_channel(target, options=GRPC_OPTIONS)
+        self.channel = grpc.insecure_channel(
+            target,
+            options=GRPC_OPTIONS,
+            compression=GRPC_COMPRESSION,
+        )
         self.stub = peer_pb2_grpc.PeerTransportStub(self.channel)
 
     def close(self) -> None:
@@ -132,6 +142,27 @@ class PeerClient:
             timeout=timeout_s,
         )
         return lease_plan_from_proto(reply.lease_plan)
+
+    def report_run_completion(
+        self,
+        completion: RunCompletionRecord,
+        timeout_s: float = 5.0,
+    ) -> dict:
+        reply = self.stub.ReportRunCompletion(
+            run_completion_to_proto(completion),
+            timeout=timeout_s,
+        )
+        return {
+            "receiver_node_id": reply.receiver_node_id,
+            "node_id": reply.node_id,
+        }
+
+    def get_run_completions(self, timeout_s: float = 5.0) -> list[RunCompletionRecord]:
+        reply = self.stub.GetRunCompletions(
+            peer_pb2.RunCompletionsRequest(),
+            timeout=timeout_s,
+        )
+        return [run_completion_from_proto(item) for item in reply.completions]
 
     def push_payload(
         self, payload: PeerPayload, timeout_s: float = 15.0

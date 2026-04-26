@@ -59,6 +59,37 @@ class CommTransportTests(unittest.TestCase):
         self.assertEqual(state["payloads"][0]["payload_kind"], "model_delta")
         self.assertEqual(state["payloads"][0]["tensor_names"], ["weights", "bias"])
 
+    def test_peer_state_counts_total_payloads_while_bounding_history(self) -> None:
+        server = PeerServer(node_id="receiver-node", host="127.0.0.1", port=0)
+        server.start()
+        self.addCleanup(server.stop)
+
+        client = PeerClient(server.address)
+        self.addCleanup(client.close)
+
+        for step in range(6):
+            payload = PeerPayload(
+                metadata=PayloadMetadata(
+                    sender_node_id="sender-node",
+                    payload_id=f"payload-{step}",
+                    payload_kind="async_weights",
+                    model_version=step,
+                    step=step,
+                    sample_count=8,
+                ),
+                tensors={
+                    "weights": torch.full((2, 2), float(step), dtype=torch.float32),
+                },
+            )
+            client.push_payload(payload)
+
+        state = client.get_peer_state()
+        self.assertEqual(state["received_payload_count"], 6)
+        self.assertEqual(len(state["payloads"]), 1)
+        self.assertEqual(state["payloads"][0]["payload_id"], "payload-5")
+        self.assertIsNone(server.get_payload("sender-node", payload_id="payload-0"))
+        self.assertIsNotNone(server.get_payload("sender-node", payload_id="payload-5"))
+
     def test_manifest_inventory_pull_and_control_plane(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)

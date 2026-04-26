@@ -64,6 +64,16 @@ class PeerTransportStub(object):
                 request_serializer=peer__pb2.LeasePlanRequest.SerializeToString,
                 response_deserializer=peer__pb2.LeasePlanReply.FromString,
                 _registered_method=True)
+        self.ReportRunCompletion = channel.unary_unary(
+                '/PeerTransport/ReportRunCompletion',
+                request_serializer=peer__pb2.RunCompletion.SerializeToString,
+                response_deserializer=peer__pb2.ReportRunCompletionReply.FromString,
+                _registered_method=True)
+        self.GetRunCompletions = channel.unary_unary(
+                '/PeerTransport/GetRunCompletions',
+                request_serializer=peer__pb2.RunCompletionsRequest.SerializeToString,
+                response_deserializer=peer__pb2.RunCompletionsReply.FromString,
+                _registered_method=True)
         self.PushPayload = channel.stream_unary(
                 '/PeerTransport/PushPayload',
                 request_serializer=peer__pb2.PayloadMessage.SerializeToString,
@@ -115,6 +125,18 @@ class PeerTransportServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ReportRunCompletion(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetRunCompletions(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def PushPayload(self, request_iterator, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -159,6 +181,16 @@ def add_PeerTransportServicer_to_server(servicer, server):
                     servicer.GetLeasePlan,
                     request_deserializer=peer__pb2.LeasePlanRequest.FromString,
                     response_serializer=peer__pb2.LeasePlanReply.SerializeToString,
+            ),
+            'ReportRunCompletion': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReportRunCompletion,
+                    request_deserializer=peer__pb2.RunCompletion.FromString,
+                    response_serializer=peer__pb2.ReportRunCompletionReply.SerializeToString,
+            ),
+            'GetRunCompletions': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetRunCompletions,
+                    request_deserializer=peer__pb2.RunCompletionsRequest.FromString,
+                    response_serializer=peer__pb2.RunCompletionsReply.SerializeToString,
             ),
             'PushPayload': grpc.stream_unary_rpc_method_handler(
                     servicer.PushPayload,
@@ -333,6 +365,60 @@ class PeerTransport(object):
             '/PeerTransport/GetLeasePlan',
             peer__pb2.LeasePlanRequest.SerializeToString,
             peer__pb2.LeasePlanReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReportRunCompletion(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/PeerTransport/ReportRunCompletion',
+            peer__pb2.RunCompletion.SerializeToString,
+            peer__pb2.ReportRunCompletionReply.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetRunCompletions(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/PeerTransport/GetRunCompletions',
+            peer__pb2.RunCompletionsRequest.SerializeToString,
+            peer__pb2.RunCompletionsReply.FromString,
             options,
             channel_credentials,
             insecure,

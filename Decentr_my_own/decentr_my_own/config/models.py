@@ -144,6 +144,7 @@ class SyncConfig(BaseModel):
 class AsyncConfig(BaseModel):
     enabled: bool = False
     push_interval_steps: int = Field(default=25, ge=1)
+    push_fanout: int = Field(default=2, ge=0)
     max_staleness: int = Field(default=4, ge=0)
     mixing_alpha: float = Field(default=0.5, gt=0, le=1)
 

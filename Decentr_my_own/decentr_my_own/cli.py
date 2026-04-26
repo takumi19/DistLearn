@@ -6,7 +6,14 @@ import time
 from pathlib import Path
 from typing import Sequence
 
-from decentr_my_own.config.loader import load_cluster_config, load_resolved_config, load_training_config
+from decentr_my_own.config.loader import (
+    load_cluster_config,
+    load_cluster_config_inline,
+    load_resolved_config,
+    load_resolved_config_inline,
+    load_training_config,
+    load_training_config_inline,
+)
 from decentr_my_own.data.loaders import build_partition_summary
 from decentr_my_own.data.shards import build_dataset_shards
 
@@ -34,22 +41,21 @@ def build_parser() -> argparse.ArgumentParser:
         "describe-node",
         help="Print the current node and its neighbors as JSON.",
     )
-    describe_parser.add_argument("--cluster", type=Path, required=True)
-    describe_parser.add_argument("--training", type=Path, required=True)
-    describe_parser.add_argument("--self-node", required=True)
+    _add_resolved_args(describe_parser)
 
     inspect_parser = subparsers.add_parser(
         "inspect-files",
         help="Load cluster/training files separately and print a short summary.",
     )
-    inspect_parser.add_argument("--cluster", type=Path, required=True)
-    inspect_parser.add_argument("--training", type=Path, required=True)
+    _add_config_source_args(inspect_parser)
 
     shard_parser = subparsers.add_parser(
         "build-shards",
         help="Build deterministic local micro-shards and a manifest from the training config.",
     )
-    shard_parser.add_argument("--training", type=Path, required=True)
+    training_source_group = shard_parser.add_mutually_exclusive_group(required=True)
+    training_source_group.add_argument("--training", type=Path)
+    training_source_group.add_argument("--training-b64")
     shard_parser.add_argument("--force", action="store_true")
 
     local_train_parser = subparsers.add_parser(
@@ -128,7 +134,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run one asynchronous training node using the configured peer graph.",
     )
     _add_resolved_args(run_async_parser)
-    run_async_parser.add_argument("--rounds", type=int, default=2)
+    run_async_parser.add_argument("--epochs", type=int)
+    run_async_parser.add_argument("--rounds", type=int)
     run_async_parser.add_argument("--max-local-batches", type=int)
     run_async_parser.add_argument("--max-eval-batches", type=int)
     run_async_parser.add_argument("--run-name")
@@ -150,6 +157,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     launch_plan_parser.add_argument("--cluster", type=Path, required=True)
     launch_plan_parser.add_argument("--training", type=Path, required=True)
+    launch_plan_parser.add_argument("--run-name")
+    launch_plan_parser.add_argument("--inline-configs", action="store_true")
+    launch_plan_parser.add_argument(
+        "--nodes",
+        help="Comma-separated subset of node ids to include in this launch. Uses a full-mesh graph for the selected nodes.",
+    )
+    launch_plan_parser.add_argument(
+        "--bootstrap-node",
+        help="Override bootstrap node id for this launch plan.",
+    )
 
     probe_parser = subparsers.add_parser(
         "probe-neighbors",
@@ -186,9 +203,40 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_resolved_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--cluster", type=Path, required=True)
-    parser.add_argument("--training", type=Path, required=True)
+    _add_config_source_args(parser)
     parser.add_argument("--self-node", required=True)
+
+
+def _add_config_source_args(parser: argparse.ArgumentParser) -> None:
+    cluster_group = parser.add_mutually_exclusive_group(required=True)
+    cluster_group.add_argument("--cluster", type=Path)
+    cluster_group.add_argument("--cluster-b64")
+    training_group = parser.add_mutually_exclusive_group(required=True)
+    training_group.add_argument("--training", type=Path)
+    training_group.add_argument("--training-b64")
+
+
+def _load_cluster_training_from_args(args) -> tuple:
+    if getattr(args, "cluster_b64", None):
+        cluster = load_cluster_config_inline(args.cluster_b64)
+    else:
+        cluster = load_cluster_config(args.cluster)
+
+    if getattr(args, "training_b64", None):
+        training = load_training_config_inline(args.training_b64)
+    else:
+        training = load_training_config(args.training)
+    return cluster, training
+
+
+def _load_resolved_from_args(args):
+    cluster_b64 = getattr(args, "cluster_b64", None)
+    training_b64 = getattr(args, "training_b64", None)
+    if cluster_b64 or training_b64:
+        if not cluster_b64 or not training_b64:
+            raise ValueError("Inline runtime config requires both --cluster-b64 and --training-b64")
+        return load_resolved_config_inline(cluster_b64, training_b64, args.self_node)
+    return load_resolved_config(args.cluster, args.training, args.self_node)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -196,7 +244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "validate-config":
-        resolved = load_resolved_config(args.cluster, args.training, args.self_node)
+        resolved = _load_resolved_from_args(args)
         print(
             "Configuration is valid for "
             f"node '{resolved.self_node_id}' in cluster '{resolved.cluster.cluster_name}'."
@@ -204,18 +252,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "show-config":
-        resolved = load_resolved_config(args.cluster, args.training, args.self_node)
+        resolved = _load_resolved_from_args(args)
         print(json.dumps(resolved.to_display_dict(), indent=2))
         return 0
 
     if args.command == "describe-node":
-        resolved = load_resolved_config(args.cluster, args.training, args.self_node)
+        resolved = _load_resolved_from_args(args)
         print(json.dumps(resolved.describe_node(), indent=2))
         return 0
 
     if args.command == "inspect-files":
-        cluster = load_cluster_config(args.cluster)
-        training = load_training_config(args.training)
+        cluster, training = _load_cluster_training_from_args(args)
         summary = {
             "cluster_name": cluster.cluster_name,
             "node_count": len(cluster.nodes),
@@ -228,14 +275,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "build-shards":
-        training = load_training_config(args.training)
+        if getattr(args, "training_b64", None):
+            training = load_training_config_inline(args.training_b64)
+        else:
+            training = load_training_config(args.training)
         print(json.dumps(build_dataset_shards(training, force=args.force).to_dict(), indent=2))
         return 0
 
     if args.command == "local-train":
         from decentr_my_own.training.engine import LocalTrainOverrides, run_local_training
 
-        resolved = load_resolved_config(args.cluster, args.training, args.self_node)
+        resolved = _load_resolved_from_args(args)
         result = run_local_training(
             resolved,
             LocalTrainOverrides(
@@ -249,7 +299,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "inspect-partition":
-        resolved = load_resolved_config(args.cluster, args.training, args.self_node)
+        resolved = _load_resolved_from_args(args)
         print(json.dumps(build_partition_summary(resolved, args.shuffle_token), indent=2))
         return 0
 
@@ -282,7 +332,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "serve-peer":
         from decentr_my_own.comm.server import PeerServer
 
-        resolved = load_resolved_config(args.cluster, args.training, args.self_node)
+        resolved = _load_resolved_from_args(args)
         port = args.bind_port or resolved.self_node.port
         server = PeerServer(
             node_id=resolved.self_node_id,
@@ -326,7 +376,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "run-sync-node":
         from decentr_my_own.algorithms.sync_barrier import SyncRunOverrides, run_sync_worker
 
-        resolved = load_resolved_config(args.cluster, args.training, args.self_node)
+        resolved = _load_resolved_from_args(args)
         print(
             json.dumps(
                 run_sync_worker(
@@ -359,12 +409,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "run-async-node":
         from decentr_my_own.algorithms.async_gossip import AsyncRunOverrides, run_async_worker
 
-        resolved = load_resolved_config(args.cluster, args.training, args.self_node)
+        resolved = _load_resolved_from_args(args)
         print(
             json.dumps(
                 run_async_worker(
                     resolved,
                     overrides=AsyncRunOverrides(
+                        epochs=args.epochs,
                         rounds=args.rounds,
                         max_local_batches=args.max_local_batches,
                         max_eval_batches=args.max_eval_batches,
@@ -383,7 +434,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "wan-preflight":
         from decentr_my_own.deployment.wan import build_wan_preflight
 
-        resolved = load_resolved_config(args.cluster, args.training, args.self_node)
+        resolved = _load_resolved_from_args(args)
         print(json.dumps(build_wan_preflight(resolved, check_dns=args.check_dns), indent=2))
         return 0
 
@@ -392,6 +443,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         cluster = load_cluster_config(args.cluster)
         training = load_training_config(args.training)
+        selected_node_ids = None
+        if args.nodes:
+            selected_node_ids = [
+                node_id.strip() for node_id in args.nodes.split(",") if node_id.strip()
+            ]
         print(
             json.dumps(
                 build_launch_plan(
@@ -399,6 +455,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     training_path=args.training,
                     cluster=cluster,
                     training=training,
+                    run_name=args.run_name,
+                    inline_configs=args.inline_configs,
+                    selected_node_ids=selected_node_ids,
+                    bootstrap_node_id=args.bootstrap_node,
                 ),
                 indent=2,
             )
@@ -408,7 +468,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "probe-neighbors":
         from decentr_my_own.deployment.wan import probe_neighbors
 
-        resolved = load_resolved_config(args.cluster, args.training, args.self_node)
+        resolved = _load_resolved_from_args(args)
         print(
             json.dumps(
                 probe_neighbors(

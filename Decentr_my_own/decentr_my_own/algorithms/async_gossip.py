@@ -20,6 +20,7 @@ from decentr_my_own.config.models import ResolvedConfig
 from decentr_my_own.data.runtime import AdaptiveMicroShardRuntime, prepare_static_micro_shards
 from decentr_my_own.data.loaders import build_local_dataloaders
 from decentr_my_own.data.manifest import load_manifest, save_manifest
+from decentr_my_own.data.scheduler_state import RunCompletionRecord
 from decentr_my_own.data.shards import build_dataset_shards
 from decentr_my_own.models.factory import build_model
 from decentr_my_own.training.device import select_device
@@ -32,6 +33,7 @@ from decentr_my_own.training.io import (
 )
 from decentr_my_own.training.metrics import (
     init_confusion_matrix,
+    macro_f1_from_confusion,
     summarize_classification_metrics,
     update_confusion_matrix,
 )
@@ -49,7 +51,8 @@ _MAX_PUSH_ATTEMPT_TIMEOUT_S = 30.0
 
 @dataclass
 class AsyncRunOverrides:
-    rounds: int = 2
+    epochs: int | None = None
+    rounds: int | None = None
     max_local_batches: int | None = None
     max_eval_batches: int | None = None
     run_name: str | None = None
@@ -64,6 +67,7 @@ def run_async_worker(
 ) -> dict:
     overrides = overrides or AsyncRunOverrides()
     config = resolved.training
+    epoch_count = _resolve_async_epoch_count(config, overrides)
     started_at = utc_now_iso()
     run_started_perf = time.perf_counter()
     set_global_seed(config.seed)
@@ -127,7 +131,7 @@ def run_async_worker(
             )
         dataloaders = None
 
-        round_history = []
+        epoch_history = []
         mixed_peer_updates_total = 0
         max_observed_staleness = 0
         failed_pushes_total = 0
@@ -135,55 +139,101 @@ def run_async_worker(
         local_step = 0
         last_mixed_payload_ids: dict[str, str] = {}
         final_test_metrics = {"loss": 0.0, "accuracy": 0.0, "macro_f1": 0.0}
+        next_adaptive_window_id = 0
 
-        for round_idx in range(overrides.rounds):
-            round_started_perf = time.perf_counter()
-            if adaptive_runtime is not None:
-                train_shard_ids = adaptive_runtime.get_window_shard_ids(round_idx)
-            else:
-                train_shard_ids = static_shard_ids
-            dataloaders = build_local_dataloaders(
-                resolved,
-                pin_memory=pin_memory,
-                train_shard_ids=train_shard_ids,
-            )
-            if dataloaders.train_sampler is not None:
-                dataloaders.train_sampler.set_epoch(round_idx)
-            if adaptive_runtime is not None and round_idx + 1 < overrides.rounds:
-                adaptive_runtime.schedule_prefetch(round_idx + 1)
+        for epoch_idx in range(epoch_count):
+            epoch_started_perf = time.perf_counter()
+            epoch_train_accumulator = _init_train_accumulator(config.model.num_classes)
+            epoch_mixed_peer_updates = 0
+            epoch_failed_pushes = 0
+            epoch_push_count = 0
+            epoch_max_staleness = 0
+            epoch_mixed_senders: set[str] = set()
+            epoch_window_count = 0
+            epoch_window_rows: list[dict[str, int | float]] = []
 
-            train_started_perf = time.perf_counter()
-            train_metrics = _train_async_window(
-                model,
-                dataloaders.train,
-                optimizer,
-                criterion,
-                device,
-                num_classes=config.model.num_classes,
-                max_batches=overrides.max_local_batches or config.optimization.local_steps,
-                start_step=local_step,
-                run_id=run_id,
-                self_node_id=resolved.self_node_id,
-                server=server,
-                neighbors=neighbors,
-                push_interval_steps=config.async_config.push_interval_steps,
-                base_alpha=config.async_config.mixing_alpha,
-                max_staleness=config.async_config.max_staleness,
-                transport_timeout_s=overrides.transport_timeout_s,
-                last_mixed_payload_ids=last_mixed_payload_ids,
-            )
-            local_step = train_metrics["last_step"]
-            if overrides.round_delay_s > 0:
-                time.sleep(overrides.round_delay_s)
-            train_duration_s = time.perf_counter() - train_started_perf
-            if adaptive_runtime is not None:
-                adaptive_runtime.report_window(
-                    window_id=round_idx,
-                    samples_processed=train_metrics["samples_processed"],
-                    duration_s=train_duration_s,
+            while True:
+                window_assignment = None
+                if adaptive_runtime is not None:
+                    window_assignment = adaptive_runtime.get_window_assignment(next_adaptive_window_id)
+                    if window_assignment.epoch_id != epoch_idx:
+                        raise RuntimeError(
+                            "Adaptive runtime returned mismatched epoch window: "
+                            f"expected epoch_id={epoch_idx}, got {window_assignment.epoch_id}"
+                        )
+                    train_shard_ids = window_assignment.shard_ids
+                else:
+                    train_shard_ids = static_shard_ids
+
+                dataloaders = build_local_dataloaders(
+                    resolved,
+                    pin_memory=pin_memory,
+                    train_shard_ids=train_shard_ids,
                 )
+                if dataloaders.train_sampler is not None:
+                    dataloaders.train_sampler.set_epoch(epoch_idx)
 
-            should_eval = (round_idx + 1) % config.optimization.eval_every_epochs == 0
+                train_started_perf = time.perf_counter()
+                train_metrics = _train_async_window(
+                    model,
+                    dataloaders.train,
+                    optimizer,
+                    criterion,
+                    device,
+                    num_classes=config.model.num_classes,
+                    max_batches=overrides.max_local_batches,
+                    start_step=local_step,
+                    run_id=run_id,
+                    self_node_id=resolved.self_node_id,
+                    server=server,
+                    neighbors=neighbors,
+                    push_fanout=config.async_config.push_fanout,
+                    push_interval_steps=config.async_config.push_interval_steps,
+                    base_alpha=config.async_config.mixing_alpha,
+                    max_staleness=config.async_config.max_staleness,
+                    transport_timeout_s=overrides.transport_timeout_s,
+                    last_mixed_payload_ids=last_mixed_payload_ids,
+                )
+                local_step = train_metrics["last_step"]
+                if overrides.round_delay_s > 0:
+                    time.sleep(overrides.round_delay_s)
+                train_duration_s = time.perf_counter() - train_started_perf
+
+                if adaptive_runtime is not None and window_assignment is not None:
+                    adaptive_runtime.report_window(
+                        window_id=window_assignment.window_id,
+                        samples_processed=train_metrics["samples_processed"],
+                        duration_s=train_duration_s,
+                    )
+                    epoch_window_rows.append(
+                        {
+                            "window_id": window_assignment.window_id,
+                            "epoch_window_index": window_assignment.epoch_window_index,
+                            "epoch_window_count": window_assignment.epoch_window_count,
+                            "assigned_shard_count": len(window_assignment.shard_ids),
+                            "samples_processed": train_metrics["samples_processed"],
+                            "duration_s": train_duration_s,
+                        }
+                    )
+                    next_adaptive_window_id += 1
+
+                _accumulate_train_metrics(epoch_train_accumulator, train_metrics)
+                epoch_mixed_peer_updates += train_metrics["mixed_peer_updates"]
+                epoch_failed_pushes += train_metrics["failed_pushes"]
+                epoch_push_count += train_metrics["pushes_sent"]
+                epoch_max_staleness = max(epoch_max_staleness, train_metrics["max_staleness"])
+                epoch_mixed_senders.update(train_metrics["mixed_senders"])
+                epoch_window_count += 1
+
+                if adaptive_runtime is not None and window_assignment is not None:
+                    if not window_assignment.is_last_window_for_epoch:
+                        adaptive_runtime.schedule_prefetch(next_adaptive_window_id)
+                        continue
+                break
+
+            train_metrics = _finalize_train_metrics(epoch_train_accumulator)
+
+            should_eval = (epoch_idx + 1) % config.optimization.eval_every_epochs == 0
             val_metrics = (
                 _evaluate(
                     model,
@@ -205,23 +255,24 @@ def run_async_worker(
                 max_batches=overrides.max_eval_batches,
             )
 
-            mixed_peer_updates_total += train_metrics["mixed_peer_updates"]
-            failed_pushes_total += train_metrics["failed_pushes"]
-            push_count_total += train_metrics["pushes_sent"]
-            max_observed_staleness = max(max_observed_staleness, train_metrics["max_staleness"])
+            mixed_peer_updates_total += epoch_mixed_peer_updates
+            failed_pushes_total += epoch_failed_pushes
+            push_count_total += epoch_push_count
+            max_observed_staleness = max(max_observed_staleness, epoch_max_staleness)
             state_digest = digest_state(extract_model_state(model))
-            round_row = {
-                "round": round_idx + 1,
+            epoch_row = {
+                "epoch": epoch_idx + 1,
                 "local_train_loss": train_metrics["loss"],
                 "local_train_accuracy": train_metrics["accuracy"],
                 "local_train_macro_f1": train_metrics["macro_f1"],
                 "samples_processed": train_metrics["samples_processed"],
-                "duration_s": time.perf_counter() - round_started_perf,
-                "mixed_peer_updates": train_metrics["mixed_peer_updates"],
-                "mixed_senders": train_metrics["mixed_senders"],
-                "max_staleness": train_metrics["max_staleness"],
-                "pushes_sent": train_metrics["pushes_sent"],
+                "duration_s": time.perf_counter() - epoch_started_perf,
+                "mixed_peer_updates": epoch_mixed_peer_updates,
+                "mixed_senders": sorted(epoch_mixed_senders),
+                "max_staleness": epoch_max_staleness,
+                "pushes_sent": epoch_push_count,
                 "failed_pushes_total": failed_pushes_total,
+                "window_count": epoch_window_count,
                 "val_loss": val_metrics["loss"],
                 "val_accuracy": val_metrics["accuracy"],
                 "val_macro_f1": val_metrics["macro_f1"],
@@ -229,40 +280,39 @@ def run_async_worker(
                 "test_accuracy": final_test_metrics["accuracy"],
                 "test_macro_f1": final_test_metrics["macro_f1"],
                 "state_digest": state_digest,
-                "last_step": train_metrics["last_step"],
+                "last_step": local_step,
             }
-            round_row["samples_per_s"] = safe_rate(
-                round_row["samples_processed"], round_row["duration_s"]
+            if epoch_window_rows:
+                epoch_row["windows"] = epoch_window_rows
+            epoch_row["samples_per_s"] = safe_rate(
+                epoch_row["samples_processed"], epoch_row["duration_s"]
             )
-            round_history.append(round_row)
+            epoch_history.append(epoch_row)
 
-            if (round_idx + 1) % config.logging.save_every_round == 0:
+            if (epoch_idx + 1) % config.logging.save_every_round == 0:
                 torch.save(
                     {
-                        "round": round_idx + 1,
+                        "epoch": epoch_idx + 1,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
-                        "metrics": round_row,
+                        "metrics": epoch_row,
                         "self_node_id": resolved.self_node_id,
                     },
-                    checkpoint_dir / f"async-round-{round_idx + 1:03d}.pt",
+                    checkpoint_dir / f"async-epoch-{epoch_idx + 1:03d}.pt",
                 )
-
-        if overrides.shutdown_grace_s > 0:
-            time.sleep(overrides.shutdown_grace_s)
 
         metrics_ext = "json" if config.logging.metrics_format == "json" else "csv"
         write_metrics(
-            log_dir / f"async_round_metrics.{metrics_ext}",
-            round_history,
+            log_dir / f"async_epoch_metrics.{metrics_ext}",
+            epoch_history,
             config.logging.metrics_format,
         )
         run_duration_s = time.perf_counter() - run_started_perf
-        total_samples_processed = sum(row["samples_processed"] for row in round_history)
+        total_samples_processed = sum(row["samples_processed"] for row in epoch_history)
         best_val_accuracy = max(
             (
                 row["val_accuracy"]
-                for row in round_history
+                for row in epoch_history
                 if row.get("val_accuracy") is not None
             ),
             default=None,
@@ -270,7 +320,7 @@ def run_async_worker(
         best_val_macro_f1 = max(
             (
                 row["val_macro_f1"]
-                for row in round_history
+                for row in epoch_history
                 if row.get("val_macro_f1") is not None
             ),
             default=None,
@@ -281,6 +331,21 @@ def run_async_worker(
             scheduler_history = adaptive_runtime.scheduler_history()
             scheduler_history_path = log_dir / "scheduler_history.csv"
             write_metrics(scheduler_history_path, scheduler_history, "csv")
+        final_state_digest = epoch_history[-1]["state_digest"] if epoch_history else None
+        completion_status = _coordinate_run_completion(
+            resolved=resolved,
+            server=server,
+            completion=RunCompletionRecord(
+                node_id=resolved.self_node_id,
+                last_window_id=max(len(epoch_history) - 1, 0),
+                total_samples_processed=total_samples_processed,
+                final_state_digest=final_state_digest,
+                completed_at=utc_now_iso(),
+            ),
+            timeout_s=_completion_timeout_s(resolved, overrides),
+        )
+        if overrides.shutdown_grace_s > 0:
+            time.sleep(min(overrides.shutdown_grace_s, 0.5))
         summary = {
             "run_id": run_id,
             "cluster_name": resolved.cluster.cluster_name,
@@ -290,19 +355,21 @@ def run_async_worker(
             "model": config.model.name,
             "mode": config.mode,
             "algorithm": config.algorithm,
-            "history_kind": "rounds",
+            "history_kind": "epochs",
             "started_at": started_at,
             "finished_at": utc_now_iso(),
             "run_duration_s": run_duration_s,
-            "round_count": len(round_history),
-            "train_sample_count": dataloaders.train_sample_count,
+            "cluster_node_count": len(resolved.cluster.nodes),
+            "epoch_count": len(epoch_history),
+            "round_count": len(epoch_history),
+            "local_train_sample_count": epoch_history[-1]["samples_processed"] if epoch_history else 0,
             "total_samples_processed": total_samples_processed,
             "effective_samples_per_s": safe_rate(total_samples_processed, run_duration_s),
             "best_val_accuracy": best_val_accuracy,
-            "best_test_accuracy": max((row["test_accuracy"] for row in round_history), default=None),
+            "best_test_accuracy": max((row["test_accuracy"] for row in epoch_history), default=None),
             "best_val_macro_f1": best_val_macro_f1,
-            "best_test_macro_f1": max((row["test_macro_f1"] for row in round_history), default=None),
-            "metrics_file": f"async_round_metrics.{metrics_ext}",
+            "best_test_macro_f1": max((row["test_macro_f1"] for row in epoch_history), default=None),
+            "metrics_file": f"async_epoch_metrics.{metrics_ext}",
             "scheduler_history_file": (
                 str(scheduler_history_path) if scheduler_history_path is not None else None
             ),
@@ -314,11 +381,21 @@ def run_async_worker(
             "failed_pushes_total": failed_pushes_total,
             "push_count_total": push_count_total,
             "max_local_step": local_step,
-            "rounds": round_history,
+            "epochs": epoch_history,
             "received_payload_count": server.snapshot().to_dict()["received_payload_count"],
             "final_test_metrics": final_test_metrics,
-            "final_state_digest": round_history[-1]["state_digest"] if round_history else None,
+            "final_state_digest": final_state_digest,
             "data_plane_stats": data_plane_stats,
+            "control_plane_role": (
+                "bootstrap"
+                if (resolved.cluster.bootstrap_node_id or resolved.self_node_id)
+                == resolved.self_node_id
+                else "follower"
+            ),
+            "completion_reported": completion_status["reported"],
+            "completion_cluster_complete": completion_status["cluster_complete"],
+            "completion_seen_count": completion_status["seen_count"],
+            "missing_completion_nodes": completion_status["missing_node_ids"],
         }
         write_summary(log_dir / "async_run_summary.json", summary)
         return summary
@@ -334,6 +411,8 @@ def run_async_smoke(
     *,
     storage_mode: str = "replicated",
     scheduler_mode: str = "static",
+    rebalance_window_batches: int | None = None,
+    fake_train_size: int | None = None,
 ) -> dict:
     if peer_count < 2:
         raise ValueError("peer_count must be at least 2")
@@ -349,6 +428,8 @@ def run_async_smoke(
             peer_count=peer_count,
             storage_mode=storage_mode,
             scheduler_mode=scheduler_mode,
+            rebalance_window_batches=rebalance_window_batches,
+            fake_train_size=fake_train_size,
         )
 
         try:
@@ -391,7 +472,7 @@ def run_async_smoke(
 
             return {
                 "peer_count": peer_count,
-                "rounds": rounds,
+                "epochs": rounds,
                 "node_results": results,
                 "exit_codes": exit_codes,
             }
@@ -507,6 +588,8 @@ def _write_async_smoke_configs(
     *,
     storage_mode: str = "replicated",
     scheduler_mode: str = "static",
+    rebalance_window_batches: int | None = None,
+    fake_train_size: int | None = None,
 ) -> tuple[Path, dict[str, Path], list[str]]:
     node_ids = [f"node-{idx + 1}" for idx in range(peer_count)]
     ports = [_find_free_port() for _ in range(peer_count)]
@@ -546,10 +629,14 @@ def _write_async_smoke_configs(
     training_payload["sync"]["enabled"] = False
     training_payload["dataset"]["partitioning"] = "homogeneous"
     training_payload["dataset"]["scheduler_mode"] = scheduler_mode
-    training_payload["dataset"]["rebalance_window_batches"] = 2
+    training_payload["dataset"]["rebalance_window_batches"] = (
+        rebalance_window_batches if rebalance_window_batches is not None else 2
+    )
     training_payload["dataset"]["throughput_ema"] = 0.0
     training_payload["dataset"]["warmup_windows"] = 1
     training_payload["dataset"]["min_local_shards"] = 1
+    if fake_train_size is not None:
+        training_payload["dataset"]["fake_train_size"] = fake_train_size
     training_payload["logging"]["log_dir"] = str(tmp_path / "logs")
     training_payload["logging"]["checkpoint_dir"] = str(tmp_path / "checkpoints")
     training_payload["optimization"]["eval_every_epochs"] = 1
@@ -630,12 +717,13 @@ def _train_async_window(
     device: torch.device,
     *,
     num_classes: int,
-    max_batches: int,
+    max_batches: int | None,
     start_step: int,
     run_id: str,
     self_node_id: str,
     server: PeerServer,
     neighbors: list,
+    push_fanout: int,
     push_interval_steps: int,
     base_alpha: float,
     max_staleness: int,
@@ -687,6 +775,7 @@ def _train_async_window(
                 self_node_id=self_node_id,
                 server=server,
                 neighbors=neighbors,
+                push_fanout=push_fanout,
                 base_alpha=base_alpha,
                 max_staleness=max_staleness,
                 transport_timeout_s=transport_timeout_s,
@@ -701,7 +790,7 @@ def _train_async_window(
             mixed_senders_seen.update(exchange_result["mixed_senders"])
             samples_since_push = 0
 
-        if processed_batches >= max_batches:
+        if max_batches is not None and processed_batches >= max_batches:
             break
 
     if processed_batches > 0 and (samples_since_push > 0 or pushes_sent == 0):
@@ -714,6 +803,7 @@ def _train_async_window(
             self_node_id=self_node_id,
             server=server,
             neighbors=neighbors,
+            push_fanout=push_fanout,
             base_alpha=base_alpha,
             max_staleness=max_staleness,
             transport_timeout_s=transport_timeout_s,
@@ -725,19 +815,58 @@ def _train_async_window(
         max_observed_staleness = max(max_observed_staleness, exchange_result["max_staleness"])
         mixed_senders_seen.update(exchange_result["mixed_senders"])
 
+    summary_metrics = summarize_classification_metrics(
+        total_loss=total_loss,
+        correct=correct,
+        total=total,
+        confusion=confusion,
+    )
     return {
-        **summarize_classification_metrics(
-            total_loss=total_loss,
-            correct=correct,
-            total=total,
-            confusion=confusion,
-        ),
+        **summary_metrics,
+        "total_loss_raw": total_loss,
+        "correct_count": correct,
+        "confusion": confusion,
         "mixed_peer_updates": mixed_peer_updates,
         "mixed_senders": sorted(mixed_senders_seen),
         "max_staleness": max_observed_staleness,
         "pushes_sent": pushes_sent,
         "failed_pushes": failed_pushes,
         "last_step": current_step,
+    }
+
+
+def _init_train_accumulator(num_classes: int) -> dict[str, object]:
+    return {
+        "total_loss_raw": 0.0,
+        "correct_count": 0,
+        "samples_processed": 0,
+        "confusion": init_confusion_matrix(num_classes),
+    }
+
+
+def _accumulate_train_metrics(accumulator: dict[str, object], window_metrics: dict[str, object]) -> None:
+    accumulator["total_loss_raw"] = float(accumulator["total_loss_raw"]) + float(
+        window_metrics["total_loss_raw"]
+    )
+    accumulator["correct_count"] = int(accumulator["correct_count"]) + int(
+        window_metrics["correct_count"]
+    )
+    accumulator["samples_processed"] = int(accumulator["samples_processed"]) + int(
+        window_metrics["samples_processed"]
+    )
+    accumulator["confusion"] += window_metrics["confusion"]
+
+
+def _finalize_train_metrics(accumulator: dict[str, object]) -> dict[str, float]:
+    total_loss = float(accumulator["total_loss_raw"])
+    correct = int(accumulator["correct_count"])
+    total = int(accumulator["samples_processed"])
+    confusion = accumulator["confusion"]
+    return {
+        "loss": total_loss / max(total, 1),
+        "accuracy": correct / max(total, 1),
+        "macro_f1": macro_f1_from_confusion(confusion),
+        "samples_processed": total,
     }
 
 
@@ -751,6 +880,7 @@ def _exchange_async_update(
     self_node_id: str,
     server: PeerServer,
     neighbors: list,
+    push_fanout: int,
     base_alpha: float,
     max_staleness: int,
     transport_timeout_s: float,
@@ -771,7 +901,13 @@ def _exchange_async_update(
 
     pushes_sent = 0
     failed_pushes = 0
-    for neighbor in neighbors:
+    selected_neighbors = _select_push_neighbors(
+        neighbors,
+        push_fanout=push_fanout,
+        current_step=current_step,
+        self_node_id=self_node_id,
+    )
+    for neighbor in selected_neighbors:
         pushed = _push_payload_best_effort(
             target=_node_target(neighbor.host, neighbor.port),
             sender_node_id=self_node_id,
@@ -846,6 +982,105 @@ def _evaluate(
 
 def _node_target(host: str, port: int) -> str:
     return f"{host}:{port}"
+
+
+def _select_push_neighbors(
+    neighbors: list,
+    *,
+    push_fanout: int,
+    current_step: int,
+    self_node_id: str,
+) -> list:
+    ordered_neighbors = sorted(neighbors, key=lambda item: item.id)
+    if push_fanout <= 0 or push_fanout >= len(ordered_neighbors):
+        return ordered_neighbors
+
+    offset_seed = current_step + sum(ord(char) for char in self_node_id)
+    offset = offset_seed % len(ordered_neighbors)
+    rotated = ordered_neighbors[offset:] + ordered_neighbors[:offset]
+    return rotated[:push_fanout]
+
+
+def _completion_timeout_s(resolved: ResolvedConfig, overrides: AsyncRunOverrides) -> float:
+    cluster_wait_floor = max(10.0, overrides.transport_timeout_s * len(resolved.cluster.nodes))
+    return max(cluster_wait_floor, overrides.shutdown_grace_s)
+
+
+def _coordinate_run_completion(
+    *,
+    resolved: ResolvedConfig,
+    server: PeerServer,
+    completion: RunCompletionRecord,
+    timeout_s: float,
+) -> dict[str, object]:
+    expected_node_ids = [node.id for node in resolved.cluster.nodes]
+    bootstrap_node_id = resolved.cluster.bootstrap_node_id or resolved.self_node_id
+    is_bootstrap = resolved.self_node_id == bootstrap_node_id
+
+    if is_bootstrap:
+        server.store_run_completion(completion)
+        cluster_complete = server.wait_for_run_completions(
+            node_ids=expected_node_ids,
+            timeout_s=timeout_s,
+        )
+        completions = server.get_run_completions()
+        seen_node_ids = {item.node_id for item in completions}
+        return {
+            "reported": True,
+            "cluster_complete": cluster_complete,
+            "seen_count": len(seen_node_ids),
+            "missing_node_ids": sorted(
+                node_id for node_id in expected_node_ids if node_id not in seen_node_ids
+            ),
+        }
+
+    reported = _report_run_completion_with_retry(
+        target=_node_target(
+            resolved.cluster.get_node(bootstrap_node_id).host,
+            resolved.cluster.get_node(bootstrap_node_id).port,
+        ),
+        completion=completion,
+        timeout_s=timeout_s,
+    )
+    return {
+        "reported": reported,
+        "cluster_complete": None,
+        "seen_count": 1 if reported else 0,
+        "missing_node_ids": [] if reported else [resolved.self_node_id],
+    }
+
+
+def _report_run_completion_with_retry(
+    *,
+    target: str,
+    completion: RunCompletionRecord,
+    timeout_s: float,
+) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        client = PeerClient(target)
+        try:
+            remaining_s = deadline - time.time()
+            if remaining_s <= 0:
+                break
+            client.report_run_completion(
+                completion,
+                timeout_s=min(_MAX_PUSH_ATTEMPT_TIMEOUT_S, max(0.5, remaining_s)),
+            )
+            return True
+        except Exception:
+            time.sleep(0.1)
+        finally:
+            client.close()
+    return False
+
+
+def _resolve_async_epoch_count(config, overrides: AsyncRunOverrides) -> int:
+    if overrides.epochs is not None:
+        return overrides.epochs
+    if overrides.rounds is not None:
+        return overrides.rounds
+    return config.optimization.epochs
 
 
 def _find_free_port() -> int:

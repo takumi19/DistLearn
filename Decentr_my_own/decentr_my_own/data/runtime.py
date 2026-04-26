@@ -17,6 +17,19 @@ _MAX_TRANSFER_BACKOFF_S = 1.0
 _MAX_IN_FLIGHT_TRANSFERS = 1
 
 
+@dataclass(frozen=True)
+class AdaptiveWindowAssignment:
+    window_id: int
+    epoch_id: int
+    epoch_window_index: int
+    epoch_window_count: int
+    shard_ids: list[str]
+
+    @property
+    def is_last_window_for_epoch(self) -> bool:
+        return self.epoch_window_index + 1 >= self.epoch_window_count
+
+
 def prepare_static_micro_shards(
     resolved: ResolvedConfig,
     server: PeerServer,
@@ -228,7 +241,7 @@ class AdaptiveMicroShardRuntime:
         repr=False,
     )
 
-    def get_window_shard_ids(self, window_id: int) -> list[str]:
+    def get_window_assignment(self, window_id: int) -> AdaptiveWindowAssignment:
         self._initialize()
         started_wait = time.perf_counter()
         prefetched = self._wait_for_prefetch(window_id)
@@ -238,15 +251,24 @@ class AdaptiveMicroShardRuntime:
 
         with self._state_lock:
             self._active_train_shard_ids = tuple(shard_ids)
-            self._stats["window_wait_s"] += elapsed_s
             if prefetched:
                 self._stats["prefetch_hits"] += 1
                 self._stats["prefetch_wait_s"] += elapsed_s
             else:
                 self._stats["prefetch_misses"] += 1
+                self._stats["window_wait_s"] += elapsed_s
 
         self._trim_cache(extra_protected_shard_ids=shard_ids)
-        return shard_ids
+        return AdaptiveWindowAssignment(
+            window_id=lease_plan.window_id,
+            epoch_id=lease_plan.epoch_id,
+            epoch_window_index=lease_plan.epoch_window_index,
+            epoch_window_count=lease_plan.epoch_window_count,
+            shard_ids=shard_ids,
+        )
+
+    def get_window_shard_ids(self, window_id: int) -> list[str]:
+        return self.get_window_assignment(window_id).shard_ids
 
     def schedule_prefetch(self, window_id: int) -> None:
         self._initialize()
@@ -295,6 +317,11 @@ class AdaptiveMicroShardRuntime:
         )
         if self._is_bootstrap:
             self.server.control_store.store_throughput_report(report)
+            if self.resolved.training.dataset.prefetch_shards > 0:
+                next_window_id = window_id + 1
+                next_plan = self.server.control_store.get_lease_plan(next_window_id)
+                if not next_plan.assignments:
+                    self._ensure_leader_plan(next_window_id)
         else:
             client = self._bootstrap_client()
             try:
@@ -611,16 +638,9 @@ class AdaptiveMicroShardRuntime:
             self._record_scheduler_window(window_id=0, report=None)
             return
 
-        node_ids = [node.id for node in self.resolved.cluster.nodes]
-        ready = self.server.wait_for_throughput_reports(
-            node_ids=node_ids,
-            window_id=window_id - 1,
-            timeout_s=self.timeout_s,
-        )
-        if not ready:
-            raise TimeoutError(
-                f"Timed out waiting for throughput reports for window {window_id - 1}"
-            )
+        # Adaptive epoch planning must not stall on every slow follower. Use whatever
+        # reports arrived for the previous epoch and keep the existing EMA for nodes
+        # that have not reported yet.
         reports = self.server.get_throughput_reports(window_id=window_id - 1)
         lease_plan = self._planner.plan_window(window_id=window_id, reports=reports)
         self.server.set_lease_plan(lease_plan)
@@ -644,6 +664,9 @@ class AdaptiveMicroShardRuntime:
         stats = self.stats()
         row = {
             "window_id": window_id,
+            "epoch_id": lease_plan.epoch_id,
+            "epoch_window_index": lease_plan.epoch_window_index,
+            "epoch_window_count": lease_plan.epoch_window_count,
             "node_id": self.resolved.self_node_id,
             "assigned_shard_count": len(assigned_shard_ids),
             "assigned_sample_count": assigned_samples,

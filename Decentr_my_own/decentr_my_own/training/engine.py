@@ -181,6 +181,7 @@ def run_local_training(
         "run_id": run_id,
         "cluster_name": resolved.cluster.cluster_name,
         "self_node_id": resolved.self_node_id,
+        "cluster_node_count": len(resolved.cluster.nodes),
         "device": str(device),
         "dataset": config.dataset.name,
         "model": config.model.name,
