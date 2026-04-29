@@ -15,6 +15,8 @@ from decentr_my_own.data.scheduler_state import LeasePlanRecord, ThroughputRepor
 _INITIAL_TRANSFER_BACKOFF_S = 0.1
 _MAX_TRANSFER_BACKOFF_S = 1.0
 _MAX_IN_FLIGHT_TRANSFERS = 1
+_MAX_METADATA_RPC_TIMEOUT_S = 10.0
+_MAX_TRANSFER_RPC_TIMEOUT_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -105,11 +107,25 @@ def _cache_dir(manifest_path: str, cache_dir: str | None) -> Path:
     return Path(cache_dir) if cache_dir is not None else Path(manifest_path).parent
 
 
+def _attempt_timeout(
+    *,
+    deadline: float,
+    max_timeout_s: float,
+    min_timeout_s: float = 0.5,
+) -> float:
+    return min(max_timeout_s, max(min_timeout_s, deadline - time.time()))
+
+
 def _fetch_manifest_with_retry(client: PeerClient, *, timeout_s: float):
     deadline = time.time() + timeout_s
     while True:
         try:
-            return client.get_manifest(timeout_s=min(2.0, max(0.5, deadline - time.time())))
+            return client.get_manifest(
+                timeout_s=_attempt_timeout(
+                    deadline=deadline,
+                    max_timeout_s=_MAX_METADATA_RPC_TIMEOUT_S,
+                )
+            )
         except Exception:
             if time.time() >= deadline:
                 raise
@@ -127,7 +143,10 @@ def _fetch_lease_plan_with_retry(
         try:
             lease_plan = client.get_lease_plan(
                 window_id=window_id,
-                timeout_s=min(2.0, max(0.5, deadline - time.time())),
+                timeout_s=_attempt_timeout(
+                    deadline=deadline,
+                    max_timeout_s=_MAX_METADATA_RPC_TIMEOUT_S,
+                ),
             )
             if lease_plan.window_id == window_id and lease_plan.assignments:
                 return lease_plan
@@ -154,7 +173,10 @@ def _pull_shard_with_retry(
                 shard_id=shard_meta.shard_id,
                 destination_path=destination_path,
                 expected_meta=shard_meta,
-                timeout_s=min(2.0, max(0.5, deadline - time.time())),
+                timeout_s=_attempt_timeout(
+                    deadline=deadline,
+                    max_timeout_s=_MAX_TRANSFER_RPC_TIMEOUT_S,
+                ),
             )
             return
         except Exception as exc:
@@ -507,7 +529,9 @@ class AdaptiveMicroShardRuntime:
             try:
                 inventories[node.id] = {
                     shard.shard_id
-                    for shard in client.list_local_shards(timeout_s=min(2.0, self.timeout_s))
+                    for shard in client.list_local_shards(
+                        timeout_s=min(_MAX_METADATA_RPC_TIMEOUT_S, self.timeout_s)
+                    )
                 }
             except Exception:
                 inventories[node.id] = set()
@@ -608,7 +632,10 @@ class AdaptiveMicroShardRuntime:
                         shard_id=shard_meta.shard_id,
                         destination_path=self.server.shard_store.resolve_path(shard_meta),
                         expected_meta=shard_meta,
-                        timeout_s=min(2.0, max(0.5, deadline - time.time())),
+                        timeout_s=_attempt_timeout(
+                            deadline=deadline,
+                            max_timeout_s=_MAX_TRANSFER_RPC_TIMEOUT_S,
+                        ),
                     )
                 self._record_transfer(result.byte_size)
                 return
