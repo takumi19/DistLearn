@@ -387,3 +387,132 @@ def _cli_prefix(platform: str) -> str:
 
 def _node_target(host: str, port: int) -> str:
     return f"{host}:{port}"
+
+
+# ---------------------------------------------------------------------------
+# Create-run / join-run helpers
+# ---------------------------------------------------------------------------
+
+def encode_run_token(
+    *,
+    cluster: ClusterConfig,
+    training: TrainingConfig,
+    run_name: str,
+    epochs: int,
+) -> str:
+    payload = {
+        "cluster": cluster.model_dump(),
+        "training": training.model_dump(by_alias=True),
+        "run_name": run_name,
+        "epochs": epochs,
+    }
+    raw = json.dumps(payload, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("utf-8")
+
+
+def decode_run_token(token: str) -> dict:
+    raw = base64.urlsafe_b64decode(token.encode("utf-8")).decode("utf-8")
+    return json.loads(raw)
+
+
+def build_create_run_output(
+    *,
+    cluster_path: str | Path | None,
+    training_path: str | Path | None,
+    cluster: ClusterConfig,
+    training: TrainingConfig,
+    run_name: str,
+    epochs: int,
+    selected_node_ids: list[str] | None = None,
+    bootstrap_node_id: str | None = None,
+) -> dict:
+    launch_cluster = _select_launch_cluster(
+        cluster,
+        selected_node_ids=selected_node_ids,
+        bootstrap_node_id=bootstrap_node_id,
+    )
+
+    effective_epochs = epochs
+    effective_run_name = run_name
+
+    # Patch training with epoch override so the token encodes the right value.
+    training_dict = training.model_dump(by_alias=True)
+    training_dict["optimization"]["epochs"] = effective_epochs
+    from decentr_my_own.config.models import TrainingConfig as TC
+    effective_training = TC(**training_dict)
+
+    run_token = encode_run_token(
+        cluster=launch_cluster,
+        training=effective_training,
+        run_name=effective_run_name,
+        epochs=effective_epochs,
+    )
+
+    bootstrap_id = launch_cluster.bootstrap_node_id or launch_cluster.nodes[0].id
+    bootstrap_node = launch_cluster.get_node(bootstrap_id)
+    bootstrap_cli = _cli_prefix(bootstrap_node.platform)
+
+    cluster_b64 = _encode_inline_config(launch_cluster.model_dump())
+    training_b64 = _encode_inline_config(effective_training.model_dump(by_alias=True))
+
+    bootstrap_command = (
+        f"{bootstrap_cli} run-async-node"
+        f" --cluster-b64 {cluster_b64}"
+        f" --training-b64 {training_b64}"
+        f" --self-node {bootstrap_id}"
+        f" --epochs {effective_epochs}"
+        f" --run-name {effective_run_name}"
+        f" --bind-host {bootstrap_node.bind_host}"
+    )
+
+    if effective_training.dataset.storage_mode == "micro_shards":
+        build_shards_command = (
+            f"{bootstrap_cli} build-shards"
+            f" --training-b64 {training_b64}"
+            " --force"
+        )
+    else:
+        build_shards_command = None
+
+    join_commands: dict[str, str] = {}
+    for node in launch_cluster.nodes:
+        if node.id == bootstrap_id:
+            continue
+        node_cli = _cli_prefix(node.platform)
+        join_commands[node.id] = (
+            f"{node_cli} join-run"
+            f" --run-token {run_token}"
+            f" --self-node {node.id}"
+            f" --bind-host {node.bind_host}"
+        )
+
+    report_command = (
+        f"decentr-my-own report-run"
+        f" --log-root {effective_training.logging.log_dir}"
+        f" --run-id {effective_run_name}"
+    )
+
+    start_order = _build_start_order(launch_cluster)
+    return {
+        "run_name": effective_run_name,
+        "run_token": run_token,
+        "cluster_name": launch_cluster.cluster_name,
+        "mode": effective_training.mode,
+        "storage_mode": effective_training.dataset.storage_mode,
+        "scheduler_mode": effective_training.dataset.scheduler_mode,
+        "bootstrap_node_id": bootstrap_id,
+        "epochs": effective_epochs,
+        "selected_nodes": [node.id for node in launch_cluster.nodes],
+        "recommended_start_order": start_order,
+        "build_shards_command": build_shards_command,
+        "bootstrap_command": bootstrap_command,
+        "join_commands": join_commands,
+        "report_command": report_command,
+        "notes": [
+            "1. On the bootstrap node, run build_shards_command first (micro_shards mode only).",
+            "2. Start the bootstrap node with bootstrap_command.",
+            "3. Start each follower node with its join_commands entry.",
+            "4. Run report_command after all nodes finish.",
+            "Pass --transport-timeout-s 30 on slow WAN links.",
+        ],
+    }

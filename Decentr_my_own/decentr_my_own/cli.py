@@ -13,6 +13,7 @@ from decentr_my_own.config.loader import (
     load_resolved_config_inline,
     load_training_config,
     load_training_config_inline,
+    load_inventory,
 )
 from decentr_my_own.data.loaders import build_partition_summary
 from decentr_my_own.data.shards import build_dataset_shards
@@ -198,6 +199,101 @@ def build_parser() -> argparse.ArgumentParser:
     compare_smoke_parser.add_argument("--peer-count", type=int, default=3)
     compare_smoke_parser.add_argument("--sync-rounds", type=int, default=1)
     compare_smoke_parser.add_argument("--async-rounds", type=int, default=2)
+
+    create_run_parser = subparsers.add_parser(
+        "create-run",
+        help=(
+            "Generate bootstrap and follower join commands for a distributed run. "
+            "Outputs a run-token and per-node commands — no manual YAML distribution needed. "
+            "Accepts --inventory (simplified format) or --cluster + --training (full format)."
+        ),
+    )
+    config_src_group = create_run_parser.add_mutually_exclusive_group(required=True)
+    config_src_group.add_argument(
+        "--inventory", type=Path,
+        help="Simplified inventory YAML with cluster nodes and training overrides.",
+    )
+    config_src_group.add_argument(
+        "--cluster", type=Path,
+        help="Full cluster YAML (requires --training as well).",
+    )
+    create_run_parser.add_argument("--training", type=Path, help="Training YAML (used with --cluster).")
+    create_run_parser.add_argument("--run-name", required=True, help="Unique name for this run.")
+    create_run_parser.add_argument("--epochs", type=int, help="Override epoch count.")
+    create_run_parser.add_argument(
+        "--nodes",
+        help="Comma-separated node ids to include (default: all). Creates full-mesh for the subset.",
+    )
+    create_run_parser.add_argument(
+        "--bootstrap-node",
+        help="Override bootstrap node id.",
+    )
+
+    join_run_parser = subparsers.add_parser(
+        "join-run",
+        help=(
+            "Start a follower node. "
+            "Use --bootstrap HOST:CONFIG_PORT to fetch config from the bootstrap automatically, "
+            "or --run-token TOKEN (legacy) for token-based config."
+        ),
+    )
+    join_src_group = join_run_parser.add_mutually_exclusive_group(required=True)
+    join_src_group.add_argument(
+        "--bootstrap",
+        metavar="HOST:CONFIG_PORT",
+        help="Bootstrap node's HTTP config address (host:config_port, where config_port = grpc_port+1).",
+    )
+    join_src_group.add_argument(
+        "--run-token",
+        help="Base64 run token produced by create-run (legacy alternative to --bootstrap).",
+    )
+    join_run_parser.add_argument("--self-node", required=True, help="This node's id.")
+    join_run_parser.add_argument("--bind-host", help="Override bind host (default: node.bind_host).")
+    join_run_parser.add_argument(
+        "--transport-timeout-s", type=float, default=30.0,
+        help="gRPC transport timeout in seconds (increase for slow WAN links).",
+    )
+    join_run_parser.add_argument(
+        "--shutdown-grace-s", type=float, default=10.0,
+        help="Seconds to keep server alive after training, so bootstrap can collect completion.",
+    )
+
+    start_run_parser = subparsers.add_parser(
+        "start-run",
+        help=(
+            "Start the bootstrap node for a distributed run. "
+            "Starts an HTTP config server so followers can join with just --bootstrap HOST:CONFIG_PORT. "
+            "Accepts --inventory (simplified) or --cluster + --training (full format)."
+        ),
+    )
+    start_run_config_group = start_run_parser.add_mutually_exclusive_group(required=True)
+    start_run_config_group.add_argument("--inventory", type=Path)
+    start_run_config_group.add_argument("--cluster", type=Path)
+    start_run_parser.add_argument("--training", type=Path)
+    start_run_parser.add_argument("--self-node", required=True, help="This node's id (must be bootstrap).")
+    start_run_parser.add_argument("--run-name")
+    start_run_parser.add_argument("--epochs", type=int)
+    start_run_parser.add_argument("--bind-host")
+    start_run_parser.add_argument("--transport-timeout-s", type=float, default=30.0)
+    start_run_parser.add_argument("--shutdown-grace-s", type=float, default=15.0)
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help=(
+            "Print per-node launch commands for a distributed run (plaintext, not JSON). "
+            "The bootstrap uses start-run; followers use join-run --bootstrap."
+        ),
+    )
+    run_config_group = run_parser.add_mutually_exclusive_group(required=True)
+    run_config_group.add_argument("--inventory", type=Path)
+    run_config_group.add_argument("--cluster", type=Path)
+    run_parser.add_argument("--training", type=Path)
+    run_parser.add_argument("--run-name", required=True)
+    run_parser.add_argument("--epochs", type=int)
+    run_parser.add_argument(
+        "--nodes",
+        help="Comma-separated node ids to include (default: all).",
+    )
 
     return parser
 
@@ -508,6 +604,208 @@ def main(argv: Sequence[str] | None = None) -> int:
                 indent=2,
             )
         )
+        return 0
+
+    if args.command == "create-run":
+        from decentr_my_own.deployment.wan import build_create_run_output
+
+        inventory_path = getattr(args, "inventory", None)
+        if inventory_path is not None:
+            cluster, training = load_inventory(inventory_path)
+            cluster_path = inventory_path
+            training_path = None
+        else:
+            if not getattr(args, "training", None):
+                parser.error("create-run requires --training when using --cluster")
+                return 2
+            cluster = load_cluster_config(args.cluster)
+            training = load_training_config(args.training)
+            cluster_path = args.cluster
+            training_path = args.training
+
+        selected_node_ids = None
+        if getattr(args, "nodes", None):
+            selected_node_ids = [n.strip() for n in args.nodes.split(",") if n.strip()]
+        epochs = args.epochs if args.epochs is not None else training.optimization.epochs
+        result = build_create_run_output(
+            cluster_path=cluster_path,
+            training_path=training_path,
+            cluster=cluster,
+            training=training,
+            run_name=args.run_name,
+            epochs=epochs,
+            selected_node_ids=selected_node_ids,
+            bootstrap_node_id=getattr(args, "bootstrap_node", None),
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "join-run":
+        import base64 as _b64
+        import json as _json
+
+        from decentr_my_own.algorithms.async_gossip import AsyncRunOverrides, run_async_worker
+        from decentr_my_own.algorithms.sync_barrier import SyncRunOverrides, run_sync_worker
+        from decentr_my_own.config.loader import load_resolved_config_inline
+
+        if args.bootstrap:
+            from decentr_my_own.comm.config_server import fetch_run_config
+            host, _, port_str = args.bootstrap.rpartition(":")
+            if not host or not port_str.isdigit():
+                parser.error("--bootstrap must be HOST:CONFIG_PORT (e.g. 100.64.0.1:50052)")
+                return 2
+            token_data = fetch_run_config(
+                host, int(port_str), timeout_s=args.transport_timeout_s
+            )
+        else:
+            from decentr_my_own.deployment.wan import decode_run_token
+            token_data = decode_run_token(args.run_token)
+
+        cluster_dict = token_data["cluster"]
+        training_dict = token_data["training"]
+        run_name = token_data.get("run_name")
+        epochs = token_data.get("epochs")
+
+        cluster_b64 = _b64.urlsafe_b64encode(
+            _json.dumps(cluster_dict, separators=(",", ":")).encode()
+        ).decode()
+        training_b64 = _b64.urlsafe_b64encode(
+            _json.dumps(training_dict, separators=(",", ":")).encode()
+        ).decode()
+        resolved = load_resolved_config_inline(cluster_b64, training_b64, args.self_node)
+        mode = resolved.training.mode
+        bind_host = args.bind_host or resolved.self_node.bind_host
+
+        if mode == "async":
+            result = run_async_worker(
+                resolved,
+                overrides=AsyncRunOverrides(
+                    epochs=epochs,
+                    run_name=run_name,
+                    transport_timeout_s=args.transport_timeout_s,
+                    bind_host=bind_host,
+                    shutdown_grace_s=args.shutdown_grace_s,
+                ),
+            )
+        elif mode == "sync":
+            result = run_sync_worker(
+                resolved,
+                overrides=SyncRunOverrides(
+                    rounds=epochs,
+                    run_name=run_name,
+                    transport_timeout_s=args.transport_timeout_s,
+                    bind_host=bind_host,
+                ),
+            )
+        else:
+            parser.error(f"join-run does not support mode={mode!r}")
+            return 2
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "start-run":
+        from decentr_my_own.algorithms.async_gossip import AsyncRunOverrides, run_async_worker
+        from decentr_my_own.comm.config_server import config_port_for
+
+        inventory_path = getattr(args, "inventory", None)
+        if inventory_path is not None:
+            cluster, training = load_inventory(inventory_path)
+        else:
+            if not getattr(args, "training", None):
+                parser.error("start-run requires --training when using --cluster")
+                return 2
+            cluster = load_cluster_config(args.cluster)
+            training = load_training_config(args.training)
+
+        import base64 as _b64
+        import json as _json
+        from decentr_my_own.config.loader import load_resolved_config_inline
+
+        cluster_b64 = _b64.urlsafe_b64encode(
+            _json.dumps(cluster.model_dump(), separators=(",", ":")).encode()
+        ).decode()
+        training_b64 = _b64.urlsafe_b64encode(
+            _json.dumps(training.model_dump(by_alias=True), separators=(",", ":")).encode()
+        ).decode()
+        resolved = load_resolved_config_inline(cluster_b64, training_b64, args.self_node)
+
+        epochs = args.epochs if args.epochs is not None else training.optimization.epochs
+        config_port = config_port_for(resolved.self_node.port)
+        print(
+            f"Bootstrap node '{resolved.self_node_id}' starting on {resolved.self_node.host}:{resolved.self_node.port}",
+            flush=True,
+        )
+        print(
+            f"Config server on port {config_port} — followers can join with:",
+            flush=True,
+        )
+        print(
+            f"  decentr-my-own join-run --bootstrap {resolved.self_node.host}:{config_port} --self-node <NODE_ID>",
+            flush=True,
+        )
+        result = run_async_worker(
+            resolved,
+            overrides=AsyncRunOverrides(
+                epochs=epochs,
+                run_name=args.run_name,
+                transport_timeout_s=args.transport_timeout_s,
+                bind_host=args.bind_host,
+                shutdown_grace_s=args.shutdown_grace_s,
+                serve_config=True,
+            ),
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+
+    if args.command == "run":
+        inventory_path = getattr(args, "inventory", None)
+        if inventory_path is not None:
+            cluster, training = load_inventory(inventory_path)
+        else:
+            if not getattr(args, "training", None):
+                parser.error("run requires --training when using --cluster")
+                return 2
+            cluster = load_cluster_config(args.cluster)
+            training = load_training_config(args.training)
+
+        selected_ids = None
+        if getattr(args, "nodes", None):
+            selected_ids = [n.strip() for n in args.nodes.split(",") if n.strip()]
+
+        all_node_ids = [node.id for node in cluster.nodes]
+        node_ids = selected_ids if selected_ids is not None else all_node_ids
+        bootstrap_id = cluster.bootstrap_node_id or node_ids[0]
+        epochs = args.epochs if args.epochs is not None else training.optimization.epochs
+
+        bootstrap_node = cluster.get_node(bootstrap_id)
+        from decentr_my_own.comm.config_server import config_port_for
+        config_port = config_port_for(bootstrap_node.port)
+
+        inventory_flag = f"--inventory {inventory_path}" if inventory_path is not None else f"--cluster {args.cluster} --training {args.training}"
+
+        lines = [f"Run: {args.run_name}  ({len(node_ids)} nodes, {epochs} epochs)", ""]
+        lines.append(f"Step 1 — On {bootstrap_id} (bootstrap):")
+        lines.append(
+            f"  decentr-my-own start-run {inventory_flag} --self-node {bootstrap_id}"
+            f" --run-name {args.run_name} --epochs {epochs}"
+            f" --bind-host 0.0.0.0 --transport-timeout-s 30 --shutdown-grace-s 15"
+        )
+        lines.append("")
+        follower_ids = [nid for nid in node_ids if nid != bootstrap_id]
+        for step, nid in enumerate(follower_ids, start=2):
+            lines.append(f"Step {step} — On {nid}:")
+            lines.append(
+                f"  decentr-my-own join-run --bootstrap {bootstrap_node.host}:{config_port}"
+                f" --self-node {nid} --bind-host 0.0.0.0"
+                f" --transport-timeout-s 30 --shutdown-grace-s 15"
+            )
+            lines.append("")
+        next_step = len(follower_ids) + 2
+        lines.append(f"Step {next_step} — After all nodes finish (on any machine):")
+        lines.append(
+            f"  decentr-my-own report-run --log-root ./artifacts/logs --run-id {args.run_name}"
+        )
+        print("\n".join(lines))
         return 0
 
     parser.error(f"Unsupported command: {args.command}")

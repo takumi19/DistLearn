@@ -1,0 +1,45 @@
+cluster:
+  name: decentr-lab
+  overlay: tailscale
+  bootstrap_node: mac
+
+nodes:
+  mac:
+    host: 100.64.0.1          # replace with your Tailscale IP or *.ts.net name
+    port: 50051
+    bind_host: 0.0.0.0
+    platform: macos
+    weight: 1.0
+    resources:
+      cpu_cores: 8
+      accelerator: mps
+      relative_speed: 1.0
+  vps1:
+    host: 100.64.0.2
+    port: 50051
+    bind_host: 0.0.0.0
+    platform: linux
+    weight: 0.4
+    resources:
+      cpu_cores: 2
+      accelerator: cpu
+      relative_speed: 0.35
+  vps2:
+    host: 100.64.0.3
+    port: 50051
+    bind_host: 0.0.0.0
+    platform: linux
+    weight: 0.4
+    resources:
+      cpu_cores: 2
+      accelerator: cpu
+      relative_speed: 0.35
+
+training:
+  mode: async
+  epochs: 50
+  batch_size: 32
+  lr: 0.03
+  scheduler_mode: adaptive
+  storage_mode: replicated
+  partitioning: heterogeneous

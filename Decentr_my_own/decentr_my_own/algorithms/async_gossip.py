@@ -60,6 +60,7 @@ class AsyncRunOverrides:
     bind_host: str | None = None
     round_delay_s: float = 0.0
     shutdown_grace_s: float = 2.0
+    serve_config: bool = False  # start HTTP config server so followers can join without a token
 
 
 def run_async_worker(
@@ -106,6 +107,24 @@ def run_async_worker(
     neighbors = [resolved.cluster.get_node(node_id) for node_id in resolved.self_node.neighbors]
     adaptive_runtime = None
     static_shard_ids: list[str] | None = None
+
+    config_http_server = None
+    if overrides.serve_config:
+        from decentr_my_own.comm.config_server import RunConfigServer, config_port_for
+        _bootstrap_nid = resolved.cluster.bootstrap_node_id or resolved.self_node_id
+        if resolved.self_node_id == _bootstrap_nid:
+            _cfg_payload = {
+                "cluster": resolved.cluster.model_dump(),
+                "training": resolved.training.model_dump(by_alias=True),
+                "run_name": overrides.run_name,
+                "epochs": epoch_count,
+            }
+            config_http_server = RunConfigServer(
+                host=overrides.bind_host or resolved.self_node.bind_host,
+                port=config_port_for(resolved.self_node.port),
+                payload=_cfg_payload,
+            )
+            config_http_server.start()
 
     try:
         _wait_for_neighbors(
@@ -345,7 +364,8 @@ def run_async_worker(
             timeout_s=_completion_timeout_s(resolved, overrides),
         )
         if overrides.shutdown_grace_s > 0:
-            time.sleep(min(overrides.shutdown_grace_s, 0.5))
+            # Keep server alive so late-arriving followers can report completion.
+            time.sleep(overrides.shutdown_grace_s)
         summary = {
             "run_id": run_id,
             "cluster_name": resolved.cluster.cluster_name,
@@ -361,7 +381,6 @@ def run_async_worker(
             "run_duration_s": run_duration_s,
             "cluster_node_count": len(resolved.cluster.nodes),
             "epoch_count": len(epoch_history),
-            "round_count": len(epoch_history),
             "local_train_sample_count": epoch_history[-1]["samples_processed"] if epoch_history else 0,
             "total_samples_processed": total_samples_processed,
             "effective_samples_per_s": safe_rate(total_samples_processed, run_duration_s),
@@ -403,6 +422,8 @@ def run_async_worker(
         if adaptive_runtime is not None:
             adaptive_runtime.close()
         server.stop(grace=0.0)
+        if config_http_server is not None:
+            config_http_server.stop()
 
 
 def run_async_smoke(
@@ -472,7 +493,7 @@ def run_async_smoke(
 
             return {
                 "peer_count": peer_count,
-                "epochs": rounds,
+                "configured_epochs": rounds,
                 "node_results": results,
                 "exit_codes": exit_codes,
             }
