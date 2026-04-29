@@ -1,0 +1,89 @@
+cluster:
+  name: decentr-wan-3node
+  overlay: tailscale
+  bootstrap_node: mac
+
+nodes:
+  mac:
+    host: 100.110.148.103
+    port: 55051
+    bind_host: 0.0.0.0
+    platform: macos
+    weight: 1.0
+    resources:
+      cpu_cores: 8
+      accelerator: mps
+      relative_speed: 1.2
+  vps1:
+    host: 100.114.132.57
+    port: 55051
+    bind_host: 0.0.0.0
+    platform: linux
+    weight: 0.4
+    resources:
+      cpu_cores: 2
+      accelerator: cpu
+      relative_speed: 0.35
+  vps2:
+    host: 100.84.195.80
+    port: 55051
+    bind_host: 0.0.0.0
+    platform: linux
+    weight: 0.4
+    resources:
+      cpu_cores: 2
+      accelerator: cpu
+      relative_speed: 0.35
+
+training:
+  mode: async
+  algorithm: gossip
+  seed: 42
+  epochs: 50
+  local_steps: 50
+  batch_size: 32
+  lr: 0.03
+  momentum: 0.9
+  weight_decay: 0.0005
+  eval_every_epochs: 1
+  model:
+    name: resnet18
+    num_classes: 100
+    normalization: groupnorm
+  dataset:
+    name: CIFAR100
+    root: ./data
+    storage_mode: micro_shards
+    manifest_path: ./artifacts/shards/manifest.json
+    cache_dir: ./artifacts/shards
+    shard_samples: 512
+    max_cache_bytes: 2147483648
+    prefetch_shards: 0
+    transfer_chunk_bytes: 1048576
+    scheduler_mode: adaptive
+    rebalance_window_batches: 64
+    throughput_ema: 0.9
+    warmup_windows: 2
+    min_local_shards: 1
+    transfer_policy: pull
+    distributed_eval: false
+    partitioning: heterogeneous
+    shuffle_scope: round_seeded
+    val_split: 0.1
+    num_workers: 0
+    download: true
+  async:
+    enabled: true
+    push_interval_steps: 100
+    push_fanout: 1
+    max_staleness: 4
+    mixing_alpha: 0.5
+  sync:
+    enabled: false
+    averaging: deltas
+    barrier_timeout_s: 120
+  logging:
+    log_dir: ./artifacts/logs
+    checkpoint_dir: ./artifacts/checkpoints
+    save_every_round: 1
+    metrics_format: csv
