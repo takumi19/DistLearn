@@ -39,9 +39,11 @@ from decentr_my_own.training.metrics import (
 )
 from decentr_my_own.training.seed import set_global_seed
 from decentr_my_own.training.state_ops import (
+    check_state_finite,
     digest_state,
     extract_model_state,
     load_model_state,
+    require_state_finite,
 )
 
 
@@ -152,6 +154,8 @@ def run_async_worker(
 
         epoch_history = []
         mixed_peer_updates_total = 0
+        dropped_peer_updates_total = 0
+        nonfinite_peer_updates_total = 0
         max_observed_staleness = 0
         failed_pushes_total = 0
         push_count_total = 0
@@ -168,6 +172,10 @@ def run_async_worker(
             epoch_push_count = 0
             epoch_max_staleness = 0
             epoch_mixed_senders: set[str] = set()
+            epoch_dropped_peer_updates = 0
+            epoch_nonfinite_peer_updates = 0
+            epoch_dropped_peer_senders: set[str] = set()
+            epoch_drop_reasons: list[str] = []
             epoch_window_count = 0
             epoch_window_rows: list[dict[str, int | float]] = []
 
@@ -242,6 +250,10 @@ def run_async_worker(
                 epoch_push_count += train_metrics["pushes_sent"]
                 epoch_max_staleness = max(epoch_max_staleness, train_metrics["max_staleness"])
                 epoch_mixed_senders.update(train_metrics["mixed_senders"])
+                epoch_dropped_peer_updates += train_metrics["dropped_peer_updates"]
+                epoch_nonfinite_peer_updates += train_metrics["nonfinite_peer_updates"]
+                epoch_dropped_peer_senders.update(train_metrics["dropped_peer_senders"])
+                epoch_drop_reasons.extend(train_metrics["drop_reasons"])
                 epoch_window_count += 1
 
                 if adaptive_runtime is not None and window_assignment is not None:
@@ -275,6 +287,8 @@ def run_async_worker(
             )
 
             mixed_peer_updates_total += epoch_mixed_peer_updates
+            dropped_peer_updates_total += epoch_dropped_peer_updates
+            nonfinite_peer_updates_total += epoch_nonfinite_peer_updates
             failed_pushes_total += epoch_failed_pushes
             push_count_total += epoch_push_count
             max_observed_staleness = max(max_observed_staleness, epoch_max_staleness)
@@ -288,6 +302,10 @@ def run_async_worker(
                 "duration_s": time.perf_counter() - epoch_started_perf,
                 "mixed_peer_updates": epoch_mixed_peer_updates,
                 "mixed_senders": sorted(epoch_mixed_senders),
+                "dropped_peer_updates": epoch_dropped_peer_updates,
+                "dropped_peer_senders": sorted(epoch_dropped_peer_senders),
+                "drop_reasons": epoch_drop_reasons,
+                "nonfinite_peer_updates": epoch_nonfinite_peer_updates,
                 "max_staleness": epoch_max_staleness,
                 "pushes_sent": epoch_push_count,
                 "failed_pushes_total": failed_pushes_total,
@@ -396,6 +414,8 @@ def run_async_worker(
             "advertise_address": _node_target(resolved.self_node.host, resolved.self_node.port),
             "neighbor_ids": [neighbor.id for neighbor in neighbors],
             "mixed_peer_updates_total": mixed_peer_updates_total,
+            "dropped_peer_updates_total": dropped_peer_updates_total,
+            "nonfinite_peer_updates_total": nonfinite_peer_updates_total,
             "max_observed_staleness": max_observed_staleness,
             "failed_pushes_total": failed_pushes_total,
             "push_count_total": push_count_total,
@@ -531,11 +551,26 @@ def _mix_with_latest_peer_payloads(
     neighbor_ids: list[str],
     base_alpha: float,
     max_staleness: int,
+    push_interval_steps: int,
     last_mixed_payload_ids: dict[str, str] | None = None,
 ) -> dict:
+    require_state_finite(current_state, context=f"current async state at version={current_version}")
     merged_state = {name: tensor.clone() for name, tensor in current_state.items()}
     snapshot = server.snapshot()
     eligible = []
+    dropped_peer_updates = 0
+    nonfinite_peer_updates = 0
+    dropped_peer_senders: set[str] = set()
+    drop_reasons: list[str] = []
+
+    def drop_payload(sender_id: str, payload_id: str, reason: str) -> None:
+        nonlocal dropped_peer_updates
+        dropped_peer_updates += 1
+        dropped_peer_senders.add(sender_id)
+        drop_reasons.append(f"{sender_id}:{reason}")
+        if last_mixed_payload_ids is not None:
+            last_mixed_payload_ids[sender_id] = payload_id
+
     for summary in snapshot.payloads:
         if summary.sender_node_id not in neighbor_ids:
             continue
@@ -546,26 +581,91 @@ def _mix_with_latest_peer_payloads(
             and last_mixed_payload_ids.get(summary.sender_node_id) == summary.payload_id
         ):
             continue
-        staleness = max(0, current_version - summary.model_version)
-        if staleness > max_staleness:
+        version_gap = abs(current_version - summary.model_version)
+        if version_gap > max_staleness:
+            drop_payload(
+                summary.sender_node_id,
+                summary.payload_id,
+                f"version_gap:{version_gap}>max:{max_staleness}",
+            )
             continue
-        payload = server.get_payload(summary.sender_node_id)
+        payload = server.get_payload(summary.sender_node_id, summary.payload_id)
         if payload is None:
             continue
-        eligible.append((summary.sender_node_id, summary.payload_id, staleness, payload))
+        peer_keys = set(payload.tensors)
+        local_keys = set(current_state)
+        if peer_keys != local_keys:
+            missing = sorted(local_keys - peer_keys)
+            extra = sorted(peer_keys - local_keys)
+            reason = (
+                f"state_keys_mismatch:missing={missing[:4]}:extra={extra[:4]}"
+            )
+            drop_payload(summary.sender_node_id, summary.payload_id, reason)
+            continue
+        incompatible_tensor = next(
+            (
+                name
+                for name in current_state
+                if current_state[name].shape != payload.tensors[name].shape
+                or current_state[name].dtype != payload.tensors[name].dtype
+            ),
+            None,
+        )
+        if incompatible_tensor is not None:
+            local_tensor = current_state[incompatible_tensor]
+            peer_tensor = payload.tensors[incompatible_tensor]
+            drop_payload(
+                summary.sender_node_id,
+                summary.payload_id,
+                "state_tensor_mismatch:"
+                f"{incompatible_tensor}:"
+                f"local_shape={tuple(local_tensor.shape)}:"
+                f"peer_shape={tuple(peer_tensor.shape)}:"
+                f"local_dtype={local_tensor.dtype}:"
+                f"peer_dtype={peer_tensor.dtype}",
+            )
+            continue
+        peer_report = check_state_finite(payload.tensors)
+        if not peer_report.ok:
+            nonfinite_peer_updates += 1
+            drop_payload(
+                summary.sender_node_id,
+                summary.payload_id,
+                f"nonfinite_payload:{peer_report.format_summary()}",
+            )
+            continue
+        eligible.append((summary.sender_node_id, summary.payload_id, version_gap, payload))
 
     eligible.sort(key=lambda item: item[0])
     mixed_senders = []
-    observed_staleness = 0
-    for sender_id, payload_id, staleness, payload in eligible:
+    observed_version_gap = 0
+    staleness_scale = float(max(push_interval_steps, 1))
+    for sender_id, payload_id, version_gap, payload in eligible:
         peer_sample_count = max(payload.metadata.sample_count, 1)
         local_weight = max(local_sample_count, 1)
         peer_ratio = peer_sample_count / float(local_weight + peer_sample_count)
-        alpha = min(1.0, base_alpha * peer_ratio / float(1 + staleness))
-        for name in merged_state:
-            merged_state[name] = merged_state[name] * (1.0 - alpha) + payload.tensors[name] * alpha
+        alpha = min(
+            1.0,
+            max(0.0, base_alpha * peer_ratio / (1.0 + version_gap / staleness_scale)),
+        )
+        proposed_state = {name: tensor.clone() for name, tensor in merged_state.items()}
+        for name in proposed_state:
+            if torch.is_floating_point(proposed_state[name]):
+                proposed_state[name] = (
+                    proposed_state[name] * (1.0 - alpha) + payload.tensors[name] * alpha
+                )
+        merged_report = check_state_finite(proposed_state)
+        if not merged_report.ok:
+            nonfinite_peer_updates += 1
+            drop_payload(
+                sender_id,
+                payload_id,
+                f"nonfinite_merged_state:{merged_report.format_summary()}",
+            )
+            continue
+        merged_state = proposed_state
         mixed_senders.append(sender_id)
-        observed_staleness = max(observed_staleness, staleness)
+        observed_version_gap = max(observed_version_gap, version_gap)
         if last_mixed_payload_ids is not None:
             last_mixed_payload_ids[sender_id] = payload_id
 
@@ -573,7 +673,11 @@ def _mix_with_latest_peer_payloads(
         "state": merged_state,
         "mixed_peer_updates": len(mixed_senders),
         "mixed_senders": mixed_senders,
-        "max_staleness": observed_staleness,
+        "max_staleness": observed_version_gap,
+        "dropped_peer_updates": dropped_peer_updates,
+        "dropped_peer_senders": sorted(dropped_peer_senders),
+        "drop_reasons": drop_reasons,
+        "nonfinite_peer_updates": nonfinite_peer_updates,
     }
 
 
@@ -730,6 +834,21 @@ def _wait_for_neighbors(self_node_id: str, neighbors: list, timeout_s: float) ->
                 client.close()
 
 
+def _tensor_finite_status(tensor: torch.Tensor) -> str:
+    tensor_cpu = tensor.detach().to("cpu")
+    finite_mask = torch.isfinite(tensor_cpu)
+    finite_count = int(finite_mask.sum().item())
+    total_count = tensor_cpu.numel()
+    if finite_count == 0:
+        return f"finite={finite_count}/{total_count}, min=None, max=None"
+    finite_values = tensor_cpu[finite_mask]
+    return (
+        f"finite={finite_count}/{total_count}, "
+        f"min={float(finite_values.min().item())}, "
+        f"max={float(finite_values.max().item())}"
+    )
+
+
 def _train_async_window(
     model: nn.Module,
     loader,
@@ -764,6 +883,10 @@ def _train_async_window(
     mixed_peer_updates = 0
     max_observed_staleness = 0
     mixed_senders_seen: set[str] = set()
+    dropped_peer_updates = 0
+    nonfinite_peer_updates = 0
+    dropped_peer_senders_seen: set[str] = set()
+    drop_reasons: list[str] = []
 
     for inputs, targets in loader:
         targets_cpu = targets.detach().to("cpu", dtype=torch.int64).reshape(-1)
@@ -772,7 +895,20 @@ def _train_async_window(
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(inputs)
+        if not bool(torch.isfinite(logits).all().item()):
+            raise FloatingPointError(
+                "Non-finite logits during async training: "
+                f"node_id={self_node_id}, step={current_step + 1}, "
+                f"batch_index={processed_batches}, {_tensor_finite_status(logits)}"
+            )
         loss = criterion(logits, targets)
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError(
+                "Non-finite loss during async training: "
+                f"node_id={self_node_id}, step={current_step + 1}, "
+                f"batch_index={processed_batches}, loss={float(loss.detach().to('cpu').item())}, "
+                f"logits={_tensor_finite_status(logits)}"
+            )
         loss.backward()
         optimizer.step()
 
@@ -790,6 +926,7 @@ def _train_async_window(
             exchange_result = _exchange_async_update(
                 model=model,
                 device=device,
+                optimizer=optimizer,
                 current_step=current_step,
                 sample_count=samples_since_push,
                 run_id=run_id,
@@ -797,6 +934,7 @@ def _train_async_window(
                 server=server,
                 neighbors=neighbors,
                 push_fanout=push_fanout,
+                push_interval_steps=push_interval_steps,
                 base_alpha=base_alpha,
                 max_staleness=max_staleness,
                 transport_timeout_s=transport_timeout_s,
@@ -809,6 +947,10 @@ def _train_async_window(
                 max_observed_staleness, exchange_result["max_staleness"]
             )
             mixed_senders_seen.update(exchange_result["mixed_senders"])
+            dropped_peer_updates += exchange_result["dropped_peer_updates"]
+            nonfinite_peer_updates += exchange_result["nonfinite_peer_updates"]
+            dropped_peer_senders_seen.update(exchange_result["dropped_peer_senders"])
+            drop_reasons.extend(exchange_result["drop_reasons"])
             samples_since_push = 0
 
         if max_batches is not None and processed_batches >= max_batches:
@@ -818,6 +960,7 @@ def _train_async_window(
         exchange_result = _exchange_async_update(
             model=model,
             device=device,
+            optimizer=optimizer,
             current_step=current_step,
             sample_count=max(samples_since_push, 1),
             run_id=run_id,
@@ -825,6 +968,7 @@ def _train_async_window(
             server=server,
             neighbors=neighbors,
             push_fanout=push_fanout,
+            push_interval_steps=push_interval_steps,
             base_alpha=base_alpha,
             max_staleness=max_staleness,
             transport_timeout_s=transport_timeout_s,
@@ -835,6 +979,10 @@ def _train_async_window(
         mixed_peer_updates += exchange_result["mixed_peer_updates"]
         max_observed_staleness = max(max_observed_staleness, exchange_result["max_staleness"])
         mixed_senders_seen.update(exchange_result["mixed_senders"])
+        dropped_peer_updates += exchange_result["dropped_peer_updates"]
+        nonfinite_peer_updates += exchange_result["nonfinite_peer_updates"]
+        dropped_peer_senders_seen.update(exchange_result["dropped_peer_senders"])
+        drop_reasons.extend(exchange_result["drop_reasons"])
 
     summary_metrics = summarize_classification_metrics(
         total_loss=total_loss,
@@ -850,6 +998,10 @@ def _train_async_window(
         "mixed_peer_updates": mixed_peer_updates,
         "mixed_senders": sorted(mixed_senders_seen),
         "max_staleness": max_observed_staleness,
+        "dropped_peer_updates": dropped_peer_updates,
+        "dropped_peer_senders": sorted(dropped_peer_senders_seen),
+        "drop_reasons": drop_reasons,
+        "nonfinite_peer_updates": nonfinite_peer_updates,
         "pushes_sent": pushes_sent,
         "failed_pushes": failed_pushes,
         "last_step": current_step,
@@ -894,6 +1046,7 @@ def _finalize_train_metrics(accumulator: dict[str, object]) -> dict[str, float]:
 def _exchange_async_update(
     model: nn.Module,
     device: torch.device,
+    optimizer: torch.optim.Optimizer,
     *,
     current_step: int,
     sample_count: int,
@@ -902,12 +1055,17 @@ def _exchange_async_update(
     server: PeerServer,
     neighbors: list,
     push_fanout: int,
+    push_interval_steps: int,
     base_alpha: float,
     max_staleness: int,
     transport_timeout_s: float,
     last_mixed_payload_ids: dict[str, str],
 ) -> dict:
     current_state = extract_model_state(model)
+    require_state_finite(
+        current_state,
+        context=f"node_id={self_node_id}, step={current_step}, outgoing async state",
+    )
     payload = PeerPayload(
         metadata=PayloadMetadata(
             sender_node_id=self_node_id,
@@ -948,9 +1106,16 @@ def _exchange_async_update(
         neighbor_ids=[neighbor.id for neighbor in neighbors],
         base_alpha=base_alpha,
         max_staleness=max_staleness,
+        push_interval_steps=push_interval_steps,
         last_mixed_payload_ids=last_mixed_payload_ids,
     )
-    load_model_state(model, merge_result["state"], device)
+    if merge_result["mixed_peer_updates"] > 0:
+        require_state_finite(
+            merge_result["state"],
+            context=f"node_id={self_node_id}, step={current_step}, merged async state",
+        )
+        load_model_state(model, merge_result["state"], device)
+        optimizer.state.clear()
     merge_result["pushes_sent"] = pushes_sent
     merge_result["failed_pushes"] = failed_pushes
     return merge_result

@@ -75,9 +75,9 @@ training:
   async:
     enabled: true
     push_interval_steps: 100
-    push_fanout: 1
-    max_staleness: 4
-    mixing_alpha: 0.5
+    push_fanout: 0
+    max_staleness: 5000
+    mixing_alpha: 0.2
   sync:
     enabled: false
     averaging: deltas

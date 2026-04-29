@@ -3,13 +3,283 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
+import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from decentr_my_own.algorithms.async_gossip import run_async_smoke
+import decentr_my_own.algorithms.async_gossip as async_gossip
+from decentr_my_own.algorithms.async_gossip import (
+    _exchange_async_update,
+    _mix_with_latest_peer_payloads,
+    run_async_smoke,
+)
+from decentr_my_own.comm.messages import PayloadMetadata, PeerPayload, StoredPayloadSummary
+
+
+class _FakeServer:
+    def __init__(self, payloads: list[PeerPayload]):
+        self._payloads = {
+            (payload.metadata.sender_node_id, payload.metadata.payload_id): payload
+            for payload in payloads
+        }
+        self._summaries = [_summary_for_payload(payload) for payload in payloads]
+
+    def snapshot(self):
+        return SimpleNamespace(payloads=self._summaries)
+
+    def get_payload(self, sender_node_id: str, payload_id: str | None = None):
+        if payload_id is None:
+            for (sender, _), payload in self._payloads.items():
+                if sender == sender_node_id:
+                    return payload
+            return None
+        return self._payloads.get((sender_node_id, payload_id))
+
+
+def _summary_for_payload(payload: PeerPayload) -> StoredPayloadSummary:
+    return StoredPayloadSummary(
+        receiver_node_id="local",
+        sender_node_id=payload.metadata.sender_node_id,
+        payload_id=payload.metadata.payload_id,
+        payload_kind=payload.metadata.payload_kind,
+        model_version=payload.metadata.model_version,
+        step=payload.metadata.step,
+        sample_count=payload.metadata.sample_count,
+        tensor_count=len(payload.tensors),
+        num_bytes=0,
+        digest="test",
+        received_at="2026-01-01T00:00:00Z",
+        tensor_names=tuple(payload.tensors),
+    )
+
+
+def _payload(
+    *,
+    sender: str = "peer",
+    payload_id: str = "payload-1",
+    version: int = 10,
+    sample_count: int = 1,
+    state: dict[str, torch.Tensor] | None = None,
+) -> PeerPayload:
+    return PeerPayload(
+        metadata=PayloadMetadata(
+            sender_node_id=sender,
+            payload_id=payload_id,
+            payload_kind="async_weights",
+            model_version=version,
+            step=version,
+            sample_count=sample_count,
+        ),
+        tensors=state or {"weight": torch.tensor([10.0])},
+    )
+
+
+def _build_optimizer_with_state(model: torch.nn.Module) -> torch.optim.Optimizer:
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+    model(torch.ones(1, 1)).sum().backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+    return optimizer
+
+
+class AsyncGossipMixingUnitTests(unittest.TestCase):
+    def test_finite_peer_payload_is_mixed(self) -> None:
+        result = _mix_with_latest_peer_payloads(
+            current_state={"weight": torch.tensor([0.0])},
+            current_version=10,
+            local_sample_count=1,
+            server=_FakeServer([_payload(version=10)]),
+            neighbor_ids=["peer"],
+            base_alpha=1.0,
+            max_staleness=100,
+            push_interval_steps=10,
+            last_mixed_payload_ids={},
+        )
+
+        self.assertEqual(result["mixed_peer_updates"], 1)
+        self.assertEqual(result["dropped_peer_updates"], 0)
+        self.assertTrue(torch.allclose(result["state"]["weight"], torch.tensor([5.0])))
+
+    def test_nonfinite_peer_payload_is_dropped_without_changing_state(self) -> None:
+        result = _mix_with_latest_peer_payloads(
+            current_state={"weight": torch.tensor([0.0])},
+            current_version=10,
+            local_sample_count=1,
+            server=_FakeServer(
+                [_payload(version=10, state={"weight": torch.tensor([float("nan")])})]
+            ),
+            neighbor_ids=["peer"],
+            base_alpha=1.0,
+            max_staleness=100,
+            push_interval_steps=10,
+            last_mixed_payload_ids={},
+        )
+
+        self.assertEqual(result["mixed_peer_updates"], 0)
+        self.assertEqual(result["dropped_peer_updates"], 1)
+        self.assertEqual(result["nonfinite_peer_updates"], 1)
+        self.assertEqual(result["dropped_peer_senders"], ["peer"])
+        self.assertIn("nonfinite_payload", result["drop_reasons"][0])
+        self.assertTrue(torch.equal(result["state"]["weight"], torch.tensor([0.0])))
+
+    def test_payload_with_large_version_gap_is_dropped(self) -> None:
+        result = _mix_with_latest_peer_payloads(
+            current_state={"weight": torch.tensor([0.0])},
+            current_version=100,
+            local_sample_count=1,
+            server=_FakeServer([_payload(version=1)]),
+            neighbor_ids=["peer"],
+            base_alpha=1.0,
+            max_staleness=10,
+            push_interval_steps=10,
+            last_mixed_payload_ids={},
+        )
+
+        self.assertEqual(result["mixed_peer_updates"], 0)
+        self.assertEqual(result["dropped_peer_updates"], 1)
+        self.assertIn("version_gap:99>max:10", result["drop_reasons"][0])
+        self.assertTrue(torch.equal(result["state"]["weight"], torch.tensor([0.0])))
+
+    def test_future_payload_uses_gap_decay(self) -> None:
+        result = _mix_with_latest_peer_payloads(
+            current_state={"weight": torch.tensor([0.0])},
+            current_version=100,
+            local_sample_count=1,
+            server=_FakeServer([_payload(version=110)]),
+            neighbor_ids=["peer"],
+            base_alpha=1.0,
+            max_staleness=100,
+            push_interval_steps=10,
+            last_mixed_payload_ids={},
+        )
+
+        self.assertEqual(result["mixed_peer_updates"], 1)
+        self.assertEqual(result["max_staleness"], 10)
+        self.assertTrue(torch.allclose(result["state"]["weight"], torch.tensor([2.5])))
+
+    def test_nonfinite_merged_state_is_dropped(self) -> None:
+        original_check_state_finite = async_gossip.check_state_finite
+
+        def fake_check_state_finite(state):
+            if torch.equal(state["weight"], torch.tensor([5.0])):
+                return original_check_state_finite({"weight": torch.tensor([float("nan")])})
+            return original_check_state_finite(state)
+
+        async_gossip.check_state_finite = fake_check_state_finite
+        try:
+            result = _mix_with_latest_peer_payloads(
+                current_state={"weight": torch.tensor([0.0])},
+                current_version=10,
+                local_sample_count=1,
+                server=_FakeServer([_payload(version=10)]),
+                neighbor_ids=["peer"],
+                base_alpha=1.0,
+                max_staleness=100,
+                push_interval_steps=10,
+                last_mixed_payload_ids={},
+            )
+        finally:
+            async_gossip.check_state_finite = original_check_state_finite
+
+        self.assertEqual(result["mixed_peer_updates"], 0)
+        self.assertEqual(result["dropped_peer_updates"], 1)
+        self.assertEqual(result["nonfinite_peer_updates"], 1)
+        self.assertIn("nonfinite_merged_state", result["drop_reasons"][0])
+        self.assertTrue(torch.equal(result["state"]["weight"], torch.tensor([0.0])))
+
+    def test_exchange_rejects_nonfinite_local_state_before_sending(self) -> None:
+        model = torch.nn.Linear(1, 1)
+        with torch.no_grad():
+            model.weight.fill_(float("nan"))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        with self.assertRaisesRegex(ValueError, "outgoing async state"):
+            _exchange_async_update(
+                model=model,
+                device=torch.device("cpu"),
+                optimizer=optimizer,
+                current_step=1,
+                sample_count=1,
+                run_id="run",
+                self_node_id="local",
+                server=_FakeServer([]),
+                neighbors=[],
+                push_fanout=0,
+                push_interval_steps=1,
+                base_alpha=1.0,
+                max_staleness=10,
+                transport_timeout_s=0.1,
+                last_mixed_payload_ids={},
+            )
+
+    def test_successful_exchange_merge_clears_optimizer_state(self) -> None:
+        model = torch.nn.Linear(1, 1)
+        optimizer = _build_optimizer_with_state(model)
+        self.assertGreater(len(optimizer.state), 0)
+        peer_state = {
+            "weight": torch.tensor([[10.0]]),
+            "bias": torch.tensor([0.0]),
+        }
+        neighbor = SimpleNamespace(id="peer", host="127.0.0.1", port=1)
+        original_push = async_gossip._push_payload_best_effort
+        async_gossip._push_payload_best_effort = lambda **_: True
+        try:
+            result = _exchange_async_update(
+                model=model,
+                device=torch.device("cpu"),
+                optimizer=optimizer,
+                current_step=10,
+                sample_count=1,
+                run_id="run",
+                self_node_id="local",
+                server=_FakeServer([_payload(version=10, state=peer_state)]),
+                neighbors=[neighbor],
+                push_fanout=0,
+                push_interval_steps=10,
+                base_alpha=1.0,
+                max_staleness=100,
+                transport_timeout_s=0.1,
+                last_mixed_payload_ids={},
+            )
+        finally:
+            async_gossip._push_payload_best_effort = original_push
+
+        self.assertEqual(result["mixed_peer_updates"], 1)
+        self.assertEqual(len(optimizer.state), 0)
+        self.assertTrue(torch.allclose(model.weight.detach(), torch.tensor([[5.0]])))
+
+    def test_exchange_without_merge_preserves_optimizer_state(self) -> None:
+        model = torch.nn.Linear(1, 1)
+        optimizer = _build_optimizer_with_state(model)
+        state_count = len(optimizer.state)
+
+        result = _exchange_async_update(
+            model=model,
+            device=torch.device("cpu"),
+            optimizer=optimizer,
+            current_step=10,
+            sample_count=1,
+            run_id="run",
+            self_node_id="local",
+            server=_FakeServer([]),
+            neighbors=[],
+            push_fanout=0,
+            push_interval_steps=10,
+            base_alpha=1.0,
+            max_staleness=100,
+            transport_timeout_s=0.1,
+            last_mixed_payload_ids={},
+        )
+
+        self.assertEqual(result["mixed_peer_updates"], 0)
+        self.assertEqual(len(optimizer.state), state_count)
 
 
 class AsyncGossipTests(unittest.TestCase):

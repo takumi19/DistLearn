@@ -1,9 +1,27 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+
+
+@dataclass(frozen=True)
+class StateFiniteReport:
+    ok: bool
+    bad_tensor_names: tuple[str, ...]
+    nan_count: int
+    inf_count: int
+
+    def format_summary(self, *, limit: int = 8) -> str:
+        shown_names = ", ".join(self.bad_tensor_names[:limit])
+        if len(self.bad_tensor_names) > limit:
+            shown_names = f"{shown_names}, ..."
+        return (
+            f"ok={self.ok}, nan_count={self.nan_count}, inf_count={self.inf_count}, "
+            f"bad_tensors=[{shown_names}]"
+        )
 
 
 def extract_model_state(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -12,6 +30,37 @@ def extract_model_state(model: nn.Module) -> dict[str, torch.Tensor]:
 
 def load_model_state(model: nn.Module, state: dict[str, torch.Tensor], device: torch.device) -> None:
     model.load_state_dict({name: tensor.to(device) for name, tensor in state.items()})
+
+
+def check_state_finite(state: dict[str, torch.Tensor]) -> StateFiniteReport:
+    bad_tensor_names: list[str] = []
+    nan_count = 0
+    inf_count = 0
+
+    for name, tensor in state.items():
+        if not torch.is_floating_point(tensor):
+            continue
+
+        tensor_cpu = tensor.detach().to("cpu")
+        tensor_nan_count = int(torch.isnan(tensor_cpu).sum().item())
+        tensor_inf_count = int(torch.isinf(tensor_cpu).sum().item())
+        if tensor_nan_count or tensor_inf_count:
+            bad_tensor_names.append(name)
+            nan_count += tensor_nan_count
+            inf_count += tensor_inf_count
+
+    return StateFiniteReport(
+        ok=not bad_tensor_names,
+        bad_tensor_names=tuple(bad_tensor_names),
+        nan_count=nan_count,
+        inf_count=inf_count,
+    )
+
+
+def require_state_finite(state: dict[str, torch.Tensor], *, context: str) -> None:
+    report = check_state_finite(state)
+    if not report.ok:
+        raise ValueError(f"{context} contains non-finite tensors: {report.format_summary()}")
 
 
 def compute_model_delta(
