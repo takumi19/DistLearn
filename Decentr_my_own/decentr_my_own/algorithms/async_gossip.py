@@ -49,6 +49,7 @@ from decentr_my_own.training.state_ops import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _MAX_PUSH_ATTEMPT_TIMEOUT_S = 30.0
+_MAX_PUSH_TOTAL_TIMEOUT_S = 60.0
 
 
 @dataclass
@@ -1139,7 +1140,7 @@ def _exchange_async_update(
             target=_node_target(neighbor.host, neighbor.port),
             sender_node_id=self_node_id,
             payload=payload,
-            timeout_s=transport_timeout_s,
+            timeout_s=min(transport_timeout_s, _MAX_PUSH_TOTAL_TIMEOUT_S),
         )
         if pushed:
             pushes_sent += 1
