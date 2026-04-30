@@ -13,8 +13,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import decentr_my_own.algorithms.async_gossip as async_gossip
 from decentr_my_own.algorithms.async_gossip import (
+    PushAttemptResult,
     _exchange_async_update,
     _mix_with_latest_peer_payloads,
+    _push_payload_best_effort,
     run_async_smoke,
 )
 from decentr_my_own.comm.messages import PayloadMetadata, PeerPayload, StoredPayloadSummary
@@ -229,7 +231,12 @@ class AsyncGossipMixingUnitTests(unittest.TestCase):
         }
         neighbor = SimpleNamespace(id="peer", host="127.0.0.1", port=1)
         original_push = async_gossip._push_payload_best_effort
-        async_gossip._push_payload_best_effort = lambda **_: True
+        async_gossip._push_payload_best_effort = lambda **kwargs: PushAttemptResult(
+            ok=True,
+            target=kwargs["target"],
+            elapsed_s=0.1,
+            num_bytes=1,
+        )
         try:
             result = _exchange_async_update(
                 model=model,
@@ -253,6 +260,9 @@ class AsyncGossipMixingUnitTests(unittest.TestCase):
 
         self.assertEqual(result["mixed_peer_updates"], 1)
         self.assertEqual(len(optimizer.state), 0)
+        self.assertEqual(result["pushes_sent"], 1)
+        self.assertEqual(result["failed_pushes"], 0)
+        self.assertEqual(result["push_elapsed_s"], 0.1)
         self.assertTrue(torch.allclose(model.weight.detach(), torch.tensor([[5.0]])))
 
     def test_exchange_without_merge_preserves_optimizer_state(self) -> None:
@@ -280,6 +290,80 @@ class AsyncGossipMixingUnitTests(unittest.TestCase):
 
         self.assertEqual(result["mixed_peer_updates"], 0)
         self.assertEqual(len(optimizer.state), state_count)
+
+    def test_exchange_records_push_failure_reason(self) -> None:
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        neighbor = SimpleNamespace(id="peer", host="127.0.0.1", port=1)
+        original_push = async_gossip._push_payload_best_effort
+        async_gossip._push_payload_best_effort = lambda **kwargs: PushAttemptResult(
+            ok=False,
+            target=kwargs["target"],
+            elapsed_s=0.2,
+            error_type="preflight_ping_failed",
+            error_message="UNAVAILABLE",
+        )
+        try:
+            result = _exchange_async_update(
+                model=model,
+                device=torch.device("cpu"),
+                optimizer=optimizer,
+                current_step=10,
+                sample_count=1,
+                run_id="run",
+                self_node_id="local",
+                server=_FakeServer([]),
+                neighbors=[neighbor],
+                push_fanout=0,
+                push_interval_steps=10,
+                base_alpha=1.0,
+                max_staleness=100,
+                transport_timeout_s=900.0,
+                last_mixed_payload_ids={},
+            )
+        finally:
+            async_gossip._push_payload_best_effort = original_push
+
+        self.assertEqual(result["pushes_sent"], 0)
+        self.assertEqual(result["failed_pushes"], 1)
+        self.assertEqual(result["push_failed_targets"], ["peer"])
+        self.assertEqual(result["push_elapsed_s"], 0.2)
+        self.assertIn("peer@127.0.0.1:1:preflight_ping_failed", result["push_failure_reasons"][0])
+
+    def test_push_uses_full_timeout_after_successful_preflight(self) -> None:
+        calls: dict[str, float] = {}
+
+        class FakeClient:
+            def __init__(self, target: str):
+                self.target = target
+
+            def ping(self, sender_node_id: str, timeout_s: float = 5.0) -> dict:
+                calls["ping_timeout_s"] = timeout_s
+                return {"receiver_node_id": "peer", "message": "pong"}
+
+            def push_payload(self, payload: PeerPayload, timeout_s: float = 15.0):
+                calls["push_timeout_s"] = timeout_s
+                return SimpleNamespace(num_bytes=123)
+
+            def close(self) -> None:
+                calls["close_count"] = calls.get("close_count", 0) + 1
+
+        original_client = async_gossip.PeerClient
+        async_gossip.PeerClient = FakeClient
+        try:
+            result = _push_payload_best_effort(
+                target="peer:55051",
+                sender_node_id="local",
+                payload=_payload(),
+                timeout_s=900.0,
+            )
+        finally:
+            async_gossip.PeerClient = original_client
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.num_bytes, 123)
+        self.assertLessEqual(calls["ping_timeout_s"], 5.0)
+        self.assertGreater(calls["push_timeout_s"], 800.0)
 
 
 class AsyncGossipTests(unittest.TestCase):

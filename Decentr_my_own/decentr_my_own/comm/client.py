@@ -170,6 +170,9 @@ class PeerClient:
         reply = self.stub.PushPayload(
             payload_to_messages(payload),
             timeout=timeout_s,
+            # Model weights are mostly random floats; gzip costs CPU on weak VPS
+            # nodes while usually saving little bandwidth.
+            compression=grpc.Compression.NoCompression,
         )
         return PushResult(
             receiver_node_id=reply.receiver_node_id,

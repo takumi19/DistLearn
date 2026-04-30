@@ -8,6 +8,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
+import grpc
 import torch
 import torch.nn as nn
 import yaml
@@ -48,8 +49,19 @@ from decentr_my_own.training.state_ops import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_MAX_PUSH_ATTEMPT_TIMEOUT_S = 30.0
-_MAX_PUSH_TOTAL_TIMEOUT_S = 60.0
+_CONTROL_RPC_ATTEMPT_TIMEOUT_S = 30.0
+_PUSH_PREFLIGHT_TIMEOUT_S = 5.0
+_MIN_RPC_TIMEOUT_S = 0.5
+
+
+@dataclass(frozen=True)
+class PushAttemptResult:
+    ok: bool
+    target: str
+    elapsed_s: float
+    error_type: str | None = None
+    error_message: str | None = None
+    num_bytes: int = 0
 
 
 @dataclass
@@ -160,6 +172,9 @@ def run_async_worker(
         max_observed_staleness = 0
         failed_pushes_total = 0
         push_count_total = 0
+        push_elapsed_s_total = 0.0
+        push_failed_targets_total: set[str] = set()
+        push_failure_reasons_total: list[str] = []
         local_step = 0
         last_mixed_payload_ids: dict[str, str] = {}
         final_test_metrics = {"loss": 0.0, "accuracy": 0.0, "macro_f1": 0.0}
@@ -171,6 +186,9 @@ def run_async_worker(
             epoch_mixed_peer_updates = 0
             epoch_failed_pushes = 0
             epoch_push_count = 0
+            epoch_push_elapsed_s = 0.0
+            epoch_push_failed_targets: set[str] = set()
+            epoch_push_failure_reasons: list[str] = []
             epoch_max_staleness = 0
             epoch_mixed_senders: set[str] = set()
             epoch_dropped_peer_updates = 0
@@ -250,6 +268,9 @@ def run_async_worker(
                 epoch_mixed_peer_updates += train_metrics["mixed_peer_updates"]
                 epoch_failed_pushes += train_metrics["failed_pushes"]
                 epoch_push_count += train_metrics["pushes_sent"]
+                epoch_push_elapsed_s += float(train_metrics["push_elapsed_s"])
+                epoch_push_failed_targets.update(train_metrics["push_failed_targets"])
+                epoch_push_failure_reasons.extend(train_metrics["push_failure_reasons"])
                 epoch_max_staleness = max(epoch_max_staleness, train_metrics["max_staleness"])
                 epoch_mixed_senders.update(train_metrics["mixed_senders"])
                 epoch_dropped_peer_updates += train_metrics["dropped_peer_updates"]
@@ -293,6 +314,9 @@ def run_async_worker(
             nonfinite_peer_updates_total += epoch_nonfinite_peer_updates
             failed_pushes_total += epoch_failed_pushes
             push_count_total += epoch_push_count
+            push_elapsed_s_total += epoch_push_elapsed_s
+            push_failed_targets_total.update(epoch_push_failed_targets)
+            push_failure_reasons_total.extend(epoch_push_failure_reasons)
             max_observed_staleness = max(max_observed_staleness, epoch_max_staleness)
             state_digest = digest_state(extract_model_state(model))
             epoch_row = {
@@ -311,6 +335,9 @@ def run_async_worker(
                 "max_staleness": epoch_max_staleness,
                 "pushes_sent": epoch_push_count,
                 "failed_pushes_total": failed_pushes_total,
+                "push_elapsed_s": epoch_push_elapsed_s,
+                "push_failed_targets": sorted(epoch_push_failed_targets),
+                "push_failure_reasons": epoch_push_failure_reasons,
                 "window_count": epoch_window_count,
                 "val_loss": val_metrics["loss"],
                 "val_accuracy": val_metrics["accuracy"],
@@ -421,6 +448,9 @@ def run_async_worker(
             "max_observed_staleness": max_observed_staleness,
             "failed_pushes_total": failed_pushes_total,
             "push_count_total": push_count_total,
+            "push_elapsed_s_total": push_elapsed_s_total,
+            "push_failed_targets_total": sorted(push_failed_targets_total),
+            "push_failure_reasons_total": push_failure_reasons_total,
             "max_local_step": local_step,
             "epochs": epoch_history,
             "received_payload_count": server.snapshot().to_dict()["received_payload_count"],
@@ -689,24 +719,66 @@ def _push_payload_best_effort(
     sender_node_id: str,
     payload: PeerPayload,
     timeout_s: float,
-) -> bool:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        client = PeerClient(target)
-        try:
-            remaining_s = deadline - time.time()
-            if remaining_s <= 0:
-                break
-            client.push_payload(
-                payload,
-                timeout_s=min(_MAX_PUSH_ATTEMPT_TIMEOUT_S, max(0.5, remaining_s)),
-            )
-            return True
-        except Exception:
-            time.sleep(0.1)
-        finally:
-            client.close()
-    return False
+) -> PushAttemptResult:
+    started = time.perf_counter()
+    timeout_s = max(_MIN_RPC_TIMEOUT_S, timeout_s)
+
+    client = PeerClient(target)
+    try:
+        client.ping(
+            sender_node_id=sender_node_id,
+            timeout_s=min(_PUSH_PREFLIGHT_TIMEOUT_S, timeout_s),
+        )
+    except Exception as exc:
+        return PushAttemptResult(
+            ok=False,
+            target=target,
+            elapsed_s=time.perf_counter() - started,
+            error_type="preflight_ping_failed",
+            error_message=_exception_summary(exc),
+        )
+    finally:
+        client.close()
+
+    remaining_s = timeout_s - (time.perf_counter() - started)
+    if remaining_s < _MIN_RPC_TIMEOUT_S:
+        return PushAttemptResult(
+            ok=False,
+            target=target,
+            elapsed_s=time.perf_counter() - started,
+            error_type="preflight_exhausted_timeout",
+            error_message=f"timeout_s={timeout_s:.3f}",
+        )
+
+    client = PeerClient(target)
+    try:
+        result = client.push_payload(payload, timeout_s=max(_MIN_RPC_TIMEOUT_S, remaining_s))
+        return PushAttemptResult(
+            ok=True,
+            target=target,
+            elapsed_s=time.perf_counter() - started,
+            num_bytes=result.num_bytes,
+        )
+    except Exception as exc:
+        return PushAttemptResult(
+            ok=False,
+            target=target,
+            elapsed_s=time.perf_counter() - started,
+            error_type="push_payload_failed",
+            error_message=_exception_summary(exc),
+        )
+    finally:
+        client.close()
+
+
+def _exception_summary(exc: Exception, *, max_len: int = 240) -> str:
+    if isinstance(exc, grpc.RpcError):
+        code = exc.code().name if exc.code() is not None else "UNKNOWN"
+        details = exc.details() or ""
+        summary = f"{type(exc).__name__}:{code}:{details}"
+    else:
+        summary = f"{type(exc).__name__}:{exc}"
+    return summary[:max_len]
 
 
 def _write_async_smoke_configs(
@@ -908,6 +980,9 @@ def _train_async_window(
     samples_since_push = 0
     pushes_sent = 0
     failed_pushes = 0
+    push_elapsed_s = 0.0
+    push_failed_targets: set[str] = set()
+    push_failure_reasons: list[str] = []
     mixed_peer_updates = 0
     max_observed_staleness = 0
     mixed_senders_seen: set[str] = set()
@@ -991,6 +1066,9 @@ def _train_async_window(
             )
             pushes_sent += exchange_result["pushes_sent"]
             failed_pushes += exchange_result["failed_pushes"]
+            push_elapsed_s += float(exchange_result["push_elapsed_s"])
+            push_failed_targets.update(exchange_result["push_failed_targets"])
+            push_failure_reasons.extend(exchange_result["push_failure_reasons"])
             mixed_peer_updates += exchange_result["mixed_peer_updates"]
             max_observed_staleness = max(
                 max_observed_staleness, exchange_result["max_staleness"]
@@ -1025,6 +1103,9 @@ def _train_async_window(
         )
         pushes_sent += exchange_result["pushes_sent"]
         failed_pushes += exchange_result["failed_pushes"]
+        push_elapsed_s += float(exchange_result["push_elapsed_s"])
+        push_failed_targets.update(exchange_result["push_failed_targets"])
+        push_failure_reasons.extend(exchange_result["push_failure_reasons"])
         mixed_peer_updates += exchange_result["mixed_peer_updates"]
         max_observed_staleness = max(max_observed_staleness, exchange_result["max_staleness"])
         mixed_senders_seen.update(exchange_result["mixed_senders"])
@@ -1053,6 +1134,9 @@ def _train_async_window(
         "nonfinite_peer_updates": nonfinite_peer_updates,
         "pushes_sent": pushes_sent,
         "failed_pushes": failed_pushes,
+        "push_elapsed_s": push_elapsed_s,
+        "push_failed_targets": sorted(push_failed_targets),
+        "push_failure_reasons": push_failure_reasons,
         "last_step": current_step,
     }
 
@@ -1129,6 +1213,9 @@ def _exchange_async_update(
 
     pushes_sent = 0
     failed_pushes = 0
+    push_elapsed_s = 0.0
+    push_failed_targets: set[str] = set()
+    push_failure_reasons: list[str] = []
     selected_neighbors = _select_push_neighbors(
         neighbors,
         push_fanout=push_fanout,
@@ -1136,16 +1223,23 @@ def _exchange_async_update(
         self_node_id=self_node_id,
     )
     for neighbor in selected_neighbors:
-        pushed = _push_payload_best_effort(
+        push_result = _push_payload_best_effort(
             target=_node_target(neighbor.host, neighbor.port),
             sender_node_id=self_node_id,
             payload=payload,
-            timeout_s=min(transport_timeout_s, _MAX_PUSH_TOTAL_TIMEOUT_S),
+            timeout_s=transport_timeout_s,
         )
-        if pushed:
+        push_elapsed_s += push_result.elapsed_s
+        if push_result.ok:
             pushes_sent += 1
         else:
             failed_pushes += 1
+            push_failed_targets.add(neighbor.id)
+            push_failure_reasons.append(
+                f"{neighbor.id}@{push_result.target}:"
+                f"{push_result.error_type or 'unknown'}:"
+                f"{push_result.error_message or ''}"
+            )
 
     merge_result = _mix_with_latest_peer_payloads(
         current_state=current_state,
@@ -1167,6 +1261,9 @@ def _exchange_async_update(
         optimizer.state.clear()
     merge_result["pushes_sent"] = pushes_sent
     merge_result["failed_pushes"] = failed_pushes
+    merge_result["push_elapsed_s"] = push_elapsed_s
+    merge_result["push_failed_targets"] = sorted(push_failed_targets)
+    merge_result["push_failure_reasons"] = push_failure_reasons
     return merge_result
 
 
@@ -1300,7 +1397,7 @@ def _report_run_completion_with_retry(
                 break
             client.report_run_completion(
                 completion,
-                timeout_s=min(_MAX_PUSH_ATTEMPT_TIMEOUT_S, max(0.5, remaining_s)),
+                timeout_s=min(_CONTROL_RPC_ATTEMPT_TIMEOUT_S, max(_MIN_RPC_TIMEOUT_S, remaining_s)),
             )
             return True
         except Exception:
