@@ -145,6 +145,8 @@ def load_inventory(path: str | Path) -> tuple["ClusterConfig", "TrainingConfig"]
         training_dict["algorithm"] = ts["algorithm"]
     if "seed" in ts:
         training_dict["seed"] = ts["seed"]
+    if "device_preference" in ts:
+        training_dict["device_preference"] = ts["device_preference"]
     if "model" in ts:
         training_dict["model"] = ts["model"]
     if "dataset" in ts and isinstance(ts["dataset"], dict):

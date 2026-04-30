@@ -46,6 +46,7 @@ nodes:
       relative_speed: 0.5
 training:
   mode: async
+  device_preference: [cpu]
   epochs: 10
   batch_size: 32
   lr: 0.01
@@ -81,6 +82,7 @@ class TestInventoryLoading(unittest.TestCase):
         self.assertIn("node-a", node_b.neighbors)
 
         self.assertEqual(training.mode, "async")
+        self.assertEqual(training.device_preference, ["cpu"])
         self.assertTrue(training.async_config.enabled)
         self.assertFalse(training.sync.enabled)
         self.assertEqual(training.optimization.epochs, 10)

@@ -850,6 +850,31 @@ def _tensor_finite_status(tensor: torch.Tensor) -> str:
     )
 
 
+def _gradient_finite_status(model: nn.Module) -> tuple[bool, str]:
+    bad_names: list[str] = []
+    max_abs_grad = 0.0
+    checked_count = 0
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        checked_count += 1
+        grad_cpu = parameter.grad.detach().to("cpu")
+        if not bool(torch.isfinite(grad_cpu).all().item()):
+            bad_names.append(name)
+            continue
+        if grad_cpu.numel() > 0:
+            max_abs_grad = max(max_abs_grad, float(grad_cpu.abs().max().item()))
+
+    shown_names = ", ".join(bad_names[:8])
+    if len(bad_names) > 8:
+        shown_names = f"{shown_names}, ..."
+    return (
+        not bad_names,
+        f"checked={checked_count}, bad_count={len(bad_names)}, "
+        f"bad_parameters=[{shown_names}], max_abs_finite_grad={max_abs_grad}",
+    )
+
+
 def _train_async_window(
     model: nn.Module,
     loader,
@@ -913,6 +938,13 @@ def _train_async_window(
             )
         loss.backward()
         if gradient_clip_norm is not None:
+            gradients_ok, gradients_summary = _gradient_finite_status(model)
+            if not gradients_ok:
+                raise FloatingPointError(
+                    "Non-finite gradients during async training: "
+                    f"node_id={self_node_id}, step={current_step + 1}, "
+                    f"batch_index={processed_batches}, {gradients_summary}"
+                )
             try:
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
@@ -923,7 +955,8 @@ def _train_async_window(
                 raise FloatingPointError(
                     "Non-finite gradients during async training: "
                     f"node_id={self_node_id}, step={current_step + 1}, "
-                    f"batch_index={processed_batches}, clip_norm={gradient_clip_norm}"
+                    f"batch_index={processed_batches}, clip_norm={gradient_clip_norm}, "
+                    f"{_gradient_finite_status(model)[1]}"
                 ) from exc
         optimizer.step()
 

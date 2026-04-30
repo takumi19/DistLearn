@@ -39,6 +39,7 @@ training:
   mode: async
   algorithm: gossip
   seed: 42
+  device_preference: [cpu]
   epochs: 50
   local_steps: 50
   batch_size: 32
