@@ -134,7 +134,7 @@ def load_inventory(path: str | Path) -> tuple["ClusterConfig", "TrainingConfig"]
 
     opt_overrides: dict = {}
     for key in ("epochs", "batch_size", "lr", "momentum", "weight_decay",
-                "eval_every_epochs", "local_steps"):
+                "gradient_clip_norm", "eval_every_epochs", "local_steps"):
         if key in ts:
             opt_overrides[key] = ts[key]
 

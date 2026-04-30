@@ -42,9 +42,10 @@ training:
   epochs: 50
   local_steps: 50
   batch_size: 32
-  lr: 0.03
+  lr: 0.005
   momentum: 0.9
   weight_decay: 0.0005
+  gradient_clip_norm: 1.0
   eval_every_epochs: 1
   model:
     name: resnet18

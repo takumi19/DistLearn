@@ -218,6 +218,7 @@ def run_async_worker(
                     push_interval_steps=config.async_config.push_interval_steps,
                     base_alpha=config.async_config.mixing_alpha,
                     max_staleness=config.async_config.max_staleness,
+                    gradient_clip_norm=config.optimization.gradient_clip_norm,
                     transport_timeout_s=overrides.transport_timeout_s,
                     last_mixed_payload_ids=last_mixed_payload_ids,
                 )
@@ -867,6 +868,7 @@ def _train_async_window(
     push_interval_steps: int,
     base_alpha: float,
     max_staleness: int,
+    gradient_clip_norm: float | None,
     transport_timeout_s: float,
     last_mixed_payload_ids: dict[str, str],
 ) -> dict[str, float | int | list[str]]:
@@ -910,6 +912,19 @@ def _train_async_window(
                 f"logits={_tensor_finite_status(logits)}"
             )
         loss.backward()
+        if gradient_clip_norm is not None:
+            try:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=gradient_clip_norm,
+                    error_if_nonfinite=True,
+                )
+            except RuntimeError as exc:
+                raise FloatingPointError(
+                    "Non-finite gradients during async training: "
+                    f"node_id={self_node_id}, step={current_step + 1}, "
+                    f"batch_index={processed_batches}, clip_norm={gradient_clip_norm}"
+                ) from exc
         optimizer.step()
 
         batch_size = targets_cpu.numel()

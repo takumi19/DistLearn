@@ -132,6 +132,7 @@ class OptimizationConfig(BaseModel):
     lr: float = Field(default=0.05, gt=0)
     momentum: float = Field(default=0.9, ge=0, le=1)
     weight_decay: float = Field(default=5e-4, ge=0)
+    gradient_clip_norm: float | None = Field(default=None, gt=0)
     eval_every_epochs: int = Field(default=1, ge=1)
 
 
