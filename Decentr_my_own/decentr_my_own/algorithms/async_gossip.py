@@ -170,6 +170,9 @@ def run_async_worker(
         dropped_peer_updates_total = 0
         nonfinite_peer_updates_total = 0
         max_observed_staleness = 0
+        max_observed_normalized_staleness = 0.0
+        stale_mixed_peer_updates_total = 0
+        hard_dropped_stale_peer_updates_total = 0
         failed_pushes_total = 0
         push_count_total = 0
         push_elapsed_s_total = 0.0
@@ -190,6 +193,9 @@ def run_async_worker(
             epoch_push_failed_targets: set[str] = set()
             epoch_push_failure_reasons: list[str] = []
             epoch_max_staleness = 0
+            epoch_max_normalized_staleness = 0.0
+            epoch_stale_mixed_peer_updates = 0
+            epoch_hard_dropped_stale_peer_updates = 0
             epoch_mixed_senders: set[str] = set()
             epoch_dropped_peer_updates = 0
             epoch_nonfinite_peer_updates = 0
@@ -237,6 +243,10 @@ def run_async_worker(
                     push_interval_steps=config.async_config.push_interval_steps,
                     base_alpha=config.async_config.mixing_alpha,
                     max_staleness=config.async_config.max_staleness,
+                    local_relative_speed=resolved.self_node.resources.relative_speed,
+                    peer_relative_speeds={
+                        neighbor.id: neighbor.resources.relative_speed for neighbor in neighbors
+                    },
                     gradient_clip_norm=config.optimization.gradient_clip_norm,
                     transport_timeout_s=overrides.transport_timeout_s,
                     last_mixed_payload_ids=last_mixed_payload_ids,
@@ -272,6 +282,14 @@ def run_async_worker(
                 epoch_push_failed_targets.update(train_metrics["push_failed_targets"])
                 epoch_push_failure_reasons.extend(train_metrics["push_failure_reasons"])
                 epoch_max_staleness = max(epoch_max_staleness, train_metrics["max_staleness"])
+                epoch_max_normalized_staleness = max(
+                    epoch_max_normalized_staleness,
+                    float(train_metrics["max_normalized_staleness"]),
+                )
+                epoch_stale_mixed_peer_updates += train_metrics["stale_mixed_peer_updates"]
+                epoch_hard_dropped_stale_peer_updates += train_metrics[
+                    "hard_dropped_stale_peer_updates"
+                ]
                 epoch_mixed_senders.update(train_metrics["mixed_senders"])
                 epoch_dropped_peer_updates += train_metrics["dropped_peer_updates"]
                 epoch_nonfinite_peer_updates += train_metrics["nonfinite_peer_updates"]
@@ -318,6 +336,12 @@ def run_async_worker(
             push_failed_targets_total.update(epoch_push_failed_targets)
             push_failure_reasons_total.extend(epoch_push_failure_reasons)
             max_observed_staleness = max(max_observed_staleness, epoch_max_staleness)
+            max_observed_normalized_staleness = max(
+                max_observed_normalized_staleness,
+                epoch_max_normalized_staleness,
+            )
+            stale_mixed_peer_updates_total += epoch_stale_mixed_peer_updates
+            hard_dropped_stale_peer_updates_total += epoch_hard_dropped_stale_peer_updates
             state_digest = digest_state(extract_model_state(model))
             epoch_row = {
                 "epoch": epoch_idx + 1,
@@ -333,6 +357,9 @@ def run_async_worker(
                 "drop_reasons": epoch_drop_reasons,
                 "nonfinite_peer_updates": epoch_nonfinite_peer_updates,
                 "max_staleness": epoch_max_staleness,
+                "max_normalized_staleness": epoch_max_normalized_staleness,
+                "stale_mixed_peer_updates": epoch_stale_mixed_peer_updates,
+                "hard_dropped_stale_peer_updates": epoch_hard_dropped_stale_peer_updates,
                 "pushes_sent": epoch_push_count,
                 "failed_pushes_total": failed_pushes_total,
                 "push_elapsed_s": epoch_push_elapsed_s,
@@ -446,6 +473,9 @@ def run_async_worker(
             "dropped_peer_updates_total": dropped_peer_updates_total,
             "nonfinite_peer_updates_total": nonfinite_peer_updates_total,
             "max_observed_staleness": max_observed_staleness,
+            "max_observed_normalized_staleness": max_observed_normalized_staleness,
+            "stale_mixed_peer_updates_total": stale_mixed_peer_updates_total,
+            "hard_dropped_stale_peer_updates_total": hard_dropped_stale_peer_updates_total,
             "failed_pushes_total": failed_pushes_total,
             "push_count_total": push_count_total,
             "push_elapsed_s_total": push_elapsed_s_total,
@@ -584,6 +614,8 @@ def _mix_with_latest_peer_payloads(
     base_alpha: float,
     max_staleness: int,
     push_interval_steps: int,
+    local_relative_speed: float = 1.0,
+    peer_relative_speeds: dict[str, float] | None = None,
     last_mixed_payload_ids: dict[str, str] | None = None,
 ) -> dict:
     require_state_finite(current_state, context=f"current async state at version={current_version}")
@@ -592,8 +624,13 @@ def _mix_with_latest_peer_payloads(
     eligible = []
     dropped_peer_updates = 0
     nonfinite_peer_updates = 0
+    hard_dropped_stale_peer_updates = 0
     dropped_peer_senders: set[str] = set()
     drop_reasons: list[str] = []
+    peer_relative_speeds = peer_relative_speeds or {}
+    local_relative_speed = max(float(local_relative_speed), 1e-9)
+    staleness_scale = float(max(max_staleness, push_interval_steps, 1))
+    hard_staleness_limit = staleness_scale * 20.0
 
     def drop_payload(sender_id: str, payload_id: str, reason: str) -> None:
         nonlocal dropped_peer_updates
@@ -613,12 +650,22 @@ def _mix_with_latest_peer_payloads(
             and last_mixed_payload_ids.get(summary.sender_node_id) == summary.payload_id
         ):
             continue
-        version_gap = abs(current_version - summary.model_version)
-        if version_gap > max_staleness:
+        raw_version_gap = abs(current_version - summary.model_version)
+        peer_relative_speed = max(
+            float(peer_relative_speeds.get(summary.sender_node_id, local_relative_speed)),
+            1e-9,
+        )
+        expected_peer_version = current_version * (peer_relative_speed / local_relative_speed)
+        normalized_version_gap = abs(summary.model_version - expected_peer_version)
+        if normalized_version_gap > hard_staleness_limit:
+            hard_dropped_stale_peer_updates += 1
             drop_payload(
                 summary.sender_node_id,
                 summary.payload_id,
-                f"version_gap:{version_gap}>max:{max_staleness}",
+                "normalized_version_gap:"
+                f"{normalized_version_gap:.3f}>hard_max:{hard_staleness_limit:.3f}:"
+                f"raw_gap={raw_version_gap}:"
+                f"expected_peer_version={expected_peer_version:.3f}",
             )
             continue
         payload = server.get_payload(summary.sender_node_id, summary.payload_id)
@@ -666,19 +713,28 @@ def _mix_with_latest_peer_payloads(
                 f"nonfinite_payload:{peer_report.format_summary()}",
             )
             continue
-        eligible.append((summary.sender_node_id, summary.payload_id, version_gap, payload))
+        eligible.append(
+            (
+                summary.sender_node_id,
+                summary.payload_id,
+                raw_version_gap,
+                normalized_version_gap,
+                payload,
+            )
+        )
 
     eligible.sort(key=lambda item: item[0])
     mixed_senders = []
     observed_version_gap = 0
-    staleness_scale = float(max(push_interval_steps, 1))
-    for sender_id, payload_id, version_gap, payload in eligible:
+    observed_normalized_version_gap = 0.0
+    stale_mixed_peer_updates = 0
+    for sender_id, payload_id, raw_version_gap, normalized_version_gap, payload in eligible:
         peer_sample_count = max(payload.metadata.sample_count, 1)
         local_weight = max(local_sample_count, 1)
         peer_ratio = peer_sample_count / float(local_weight + peer_sample_count)
         alpha = min(
             1.0,
-            max(0.0, base_alpha * peer_ratio / (1.0 + version_gap / staleness_scale)),
+            max(0.0, base_alpha * peer_ratio / (1.0 + normalized_version_gap / staleness_scale)),
         )
         proposed_state = {name: tensor.clone() for name, tensor in merged_state.items()}
         for name in proposed_state:
@@ -697,7 +753,13 @@ def _mix_with_latest_peer_payloads(
             continue
         merged_state = proposed_state
         mixed_senders.append(sender_id)
-        observed_version_gap = max(observed_version_gap, version_gap)
+        observed_version_gap = max(observed_version_gap, raw_version_gap)
+        observed_normalized_version_gap = max(
+            observed_normalized_version_gap,
+            normalized_version_gap,
+        )
+        if raw_version_gap > max_staleness:
+            stale_mixed_peer_updates += 1
         if last_mixed_payload_ids is not None:
             last_mixed_payload_ids[sender_id] = payload_id
 
@@ -706,6 +768,9 @@ def _mix_with_latest_peer_payloads(
         "mixed_peer_updates": len(mixed_senders),
         "mixed_senders": mixed_senders,
         "max_staleness": observed_version_gap,
+        "max_normalized_staleness": observed_normalized_version_gap,
+        "stale_mixed_peer_updates": stale_mixed_peer_updates,
+        "hard_dropped_stale_peer_updates": hard_dropped_stale_peer_updates,
         "dropped_peer_updates": dropped_peer_updates,
         "dropped_peer_senders": sorted(dropped_peer_senders),
         "drop_reasons": drop_reasons,
@@ -966,6 +1031,8 @@ def _train_async_window(
     push_interval_steps: int,
     base_alpha: float,
     max_staleness: int,
+    local_relative_speed: float,
+    peer_relative_speeds: dict[str, float],
     gradient_clip_norm: float | None,
     transport_timeout_s: float,
     last_mixed_payload_ids: dict[str, str],
@@ -985,6 +1052,9 @@ def _train_async_window(
     push_failure_reasons: list[str] = []
     mixed_peer_updates = 0
     max_observed_staleness = 0
+    max_observed_normalized_staleness = 0.0
+    stale_mixed_peer_updates = 0
+    hard_dropped_stale_peer_updates = 0
     mixed_senders_seen: set[str] = set()
     dropped_peer_updates = 0
     nonfinite_peer_updates = 0
@@ -1061,6 +1131,8 @@ def _train_async_window(
                 push_interval_steps=push_interval_steps,
                 base_alpha=base_alpha,
                 max_staleness=max_staleness,
+                local_relative_speed=local_relative_speed,
+                peer_relative_speeds=peer_relative_speeds,
                 transport_timeout_s=transport_timeout_s,
                 last_mixed_payload_ids=last_mixed_payload_ids,
             )
@@ -1073,6 +1145,14 @@ def _train_async_window(
             max_observed_staleness = max(
                 max_observed_staleness, exchange_result["max_staleness"]
             )
+            max_observed_normalized_staleness = max(
+                max_observed_normalized_staleness,
+                float(exchange_result["max_normalized_staleness"]),
+            )
+            stale_mixed_peer_updates += exchange_result["stale_mixed_peer_updates"]
+            hard_dropped_stale_peer_updates += exchange_result[
+                "hard_dropped_stale_peer_updates"
+            ]
             mixed_senders_seen.update(exchange_result["mixed_senders"])
             dropped_peer_updates += exchange_result["dropped_peer_updates"]
             nonfinite_peer_updates += exchange_result["nonfinite_peer_updates"]
@@ -1098,6 +1178,8 @@ def _train_async_window(
             push_interval_steps=push_interval_steps,
             base_alpha=base_alpha,
             max_staleness=max_staleness,
+            local_relative_speed=local_relative_speed,
+            peer_relative_speeds=peer_relative_speeds,
             transport_timeout_s=transport_timeout_s,
             last_mixed_payload_ids=last_mixed_payload_ids,
         )
@@ -1108,6 +1190,12 @@ def _train_async_window(
         push_failure_reasons.extend(exchange_result["push_failure_reasons"])
         mixed_peer_updates += exchange_result["mixed_peer_updates"]
         max_observed_staleness = max(max_observed_staleness, exchange_result["max_staleness"])
+        max_observed_normalized_staleness = max(
+            max_observed_normalized_staleness,
+            float(exchange_result["max_normalized_staleness"]),
+        )
+        stale_mixed_peer_updates += exchange_result["stale_mixed_peer_updates"]
+        hard_dropped_stale_peer_updates += exchange_result["hard_dropped_stale_peer_updates"]
         mixed_senders_seen.update(exchange_result["mixed_senders"])
         dropped_peer_updates += exchange_result["dropped_peer_updates"]
         nonfinite_peer_updates += exchange_result["nonfinite_peer_updates"]
@@ -1128,6 +1216,9 @@ def _train_async_window(
         "mixed_peer_updates": mixed_peer_updates,
         "mixed_senders": sorted(mixed_senders_seen),
         "max_staleness": max_observed_staleness,
+        "max_normalized_staleness": max_observed_normalized_staleness,
+        "stale_mixed_peer_updates": stale_mixed_peer_updates,
+        "hard_dropped_stale_peer_updates": hard_dropped_stale_peer_updates,
         "dropped_peer_updates": dropped_peer_updates,
         "dropped_peer_senders": sorted(dropped_peer_senders_seen),
         "drop_reasons": drop_reasons,
@@ -1193,6 +1284,8 @@ def _exchange_async_update(
     max_staleness: int,
     transport_timeout_s: float,
     last_mixed_payload_ids: dict[str, str],
+    local_relative_speed: float = 1.0,
+    peer_relative_speeds: dict[str, float] | None = None,
 ) -> dict:
     current_state = extract_model_state(model)
     require_state_finite(
@@ -1250,6 +1343,8 @@ def _exchange_async_update(
         base_alpha=base_alpha,
         max_staleness=max_staleness,
         push_interval_steps=push_interval_steps,
+        local_relative_speed=local_relative_speed,
+        peer_relative_speeds=peer_relative_speeds,
         last_mixed_payload_ids=last_mixed_payload_ids,
     )
     if merge_result["mixed_peer_updates"] > 0:

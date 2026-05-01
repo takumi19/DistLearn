@@ -131,10 +131,10 @@ class AsyncGossipMixingUnitTests(unittest.TestCase):
         self.assertIn("nonfinite_payload", result["drop_reasons"][0])
         self.assertTrue(torch.equal(result["state"]["weight"], torch.tensor([0.0])))
 
-    def test_payload_with_large_version_gap_is_dropped(self) -> None:
+    def test_payload_with_extreme_normalized_version_gap_is_dropped(self) -> None:
         result = _mix_with_latest_peer_payloads(
             current_state={"weight": torch.tensor([0.0])},
-            current_version=100,
+            current_version=10000,
             local_sample_count=1,
             server=_FakeServer([_payload(version=1)]),
             neighbor_ids=["peer"],
@@ -146,7 +146,8 @@ class AsyncGossipMixingUnitTests(unittest.TestCase):
 
         self.assertEqual(result["mixed_peer_updates"], 0)
         self.assertEqual(result["dropped_peer_updates"], 1)
-        self.assertIn("version_gap:99>max:10", result["drop_reasons"][0])
+        self.assertEqual(result["hard_dropped_stale_peer_updates"], 1)
+        self.assertIn("normalized_version_gap", result["drop_reasons"][0])
         self.assertTrue(torch.equal(result["state"]["weight"], torch.tensor([0.0])))
 
     def test_future_payload_uses_gap_decay(self) -> None:
@@ -164,7 +165,30 @@ class AsyncGossipMixingUnitTests(unittest.TestCase):
 
         self.assertEqual(result["mixed_peer_updates"], 1)
         self.assertEqual(result["max_staleness"], 10)
-        self.assertTrue(torch.allclose(result["state"]["weight"], torch.tensor([2.5])))
+        self.assertTrue(
+            torch.allclose(result["state"]["weight"], torch.tensor([4.5454545]))
+        )
+
+    def test_slow_peer_is_mixed_when_gap_matches_relative_speed(self) -> None:
+        result = _mix_with_latest_peer_payloads(
+            current_state={"weight": torch.tensor([0.0])},
+            current_version=22000,
+            local_sample_count=1,
+            server=_FakeServer([_payload(version=6400)]),
+            neighbor_ids=["peer"],
+            base_alpha=1.0,
+            max_staleness=5000,
+            push_interval_steps=100,
+            local_relative_speed=1.2,
+            peer_relative_speeds={"peer": 0.35},
+            last_mixed_payload_ids={},
+        )
+
+        self.assertEqual(result["mixed_peer_updates"], 1)
+        self.assertEqual(result["dropped_peer_updates"], 0)
+        self.assertEqual(result["stale_mixed_peer_updates"], 1)
+        self.assertGreater(result["max_staleness"], 5000)
+        self.assertLess(result["max_normalized_staleness"], 50)
 
     def test_nonfinite_merged_state_is_dropped(self) -> None:
         original_check_state_finite = async_gossip.check_state_finite

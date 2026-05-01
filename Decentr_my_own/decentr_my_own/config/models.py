@@ -149,7 +149,10 @@ class AsyncConfig(BaseModel):
     max_staleness: int = Field(
         default=4,
         ge=0,
-        description="Maximum absolute model-version gap accepted for async peer mixing.",
+        description=(
+            "Soft normalized model-version gap used to decay async peer mixing. "
+            "The gap is normalized by node relative_speed for heterogeneous clusters."
+        ),
     )
     mixing_alpha: float = Field(default=0.5, gt=0, le=1)
 

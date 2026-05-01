@@ -129,6 +129,9 @@ def aggregate_node_summaries(
     state_digests = []
     mixed_peer_updates = []
     max_staleness = []
+    max_normalized_staleness = []
+    stale_mixed_peer_updates = []
+    hard_dropped_stale_peer_updates = []
     failed_pushes = []
     push_counts = []
     received_payload_counts = []
@@ -159,6 +162,18 @@ def aggregate_node_summaries(
             mixed_peer_updates.append(_int_or_none(item.get("mixed_peer_updates_total")))
         if item.get("max_observed_staleness") is not None:
             max_staleness.append(_int_or_none(item.get("max_observed_staleness")))
+        if item.get("max_observed_normalized_staleness") is not None:
+            max_normalized_staleness.append(
+                _float_or_none(item.get("max_observed_normalized_staleness"))
+            )
+        if item.get("stale_mixed_peer_updates_total") is not None:
+            stale_mixed_peer_updates.append(
+                _int_or_none(item.get("stale_mixed_peer_updates_total"))
+            )
+        if item.get("hard_dropped_stale_peer_updates_total") is not None:
+            hard_dropped_stale_peer_updates.append(
+                _int_or_none(item.get("hard_dropped_stale_peer_updates_total"))
+            )
         if item.get("failed_pushes_total") is not None:
             failed_pushes.append(_int_or_none(item.get("failed_pushes_total")))
         if item.get("push_count_total") is not None:
@@ -238,6 +253,16 @@ def aggregate_node_summaries(
     if max_staleness:
         report["max_observed_staleness_max"] = max(
             value for value in max_staleness if value is not None
+        )
+    if max_normalized_staleness:
+        report["max_observed_normalized_staleness_max"] = _max(max_normalized_staleness)
+    if stale_mixed_peer_updates:
+        report["stale_mixed_peer_updates_total_sum"] = int(
+            sum(value for value in stale_mixed_peer_updates if value is not None)
+        )
+    if hard_dropped_stale_peer_updates:
+        report["hard_dropped_stale_peer_updates_total_sum"] = int(
+            sum(value for value in hard_dropped_stale_peer_updates if value is not None)
         )
     if failed_pushes:
         report["failed_pushes_total_sum"] = int(
