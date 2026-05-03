@@ -15,7 +15,7 @@ nodes:
       accelerator: cpu
       relative_speed: 1.2
   maxim:
-    host: 100.65.58.88
+    host: 100.74.47.42
     port: 55051
     bind_host: 0.0.0.0
     platform: macos
@@ -25,7 +25,7 @@ nodes:
       accelerator: cpu
       relative_speed: 1.0
   polina:
-    host: 100.70.11.4
+    host: 100.114.61.41
     port: 55051
     bind_host: 0.0.0.0
     platform: macos
