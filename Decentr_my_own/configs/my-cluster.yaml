@@ -1,9 +1,19 @@
 cluster:
-  name: decentr-wan-cifar10-3node
+  name: decentr-wan-cifar10-4node
   overlay: tailscale
-  bootstrap_node: maxim
+  bootstrap_node: mac
 
 nodes:
+  mac:
+    host: 100.110.148.103
+    port: 55051
+    bind_host: 0.0.0.0
+    platform: macos
+    weight: 1.0
+    resources:
+      cpu_cores: 8
+      accelerator: cpu
+      relative_speed: 1.2
   maxim:
     host: 100.65.58.88
     port: 55051
@@ -13,7 +23,7 @@ nodes:
     resources:
       cpu_cores: 8
       accelerator: cpu
-      relative_speed: 1.2
+      relative_speed: 1.0
   polina:
     host: 100.70.11.4
     port: 55051
