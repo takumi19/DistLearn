@@ -18,6 +18,21 @@ from decentr_my_own.data.shard_dataset import (
 )
 from decentr_my_own.data.shard_store import ShardStore
 
+CIFAR_DATASETS = {
+    "cifar10": {
+        "factory": datasets.CIFAR10,
+        "mean": (0.4914, 0.4822, 0.4465),
+        "std": (0.2470, 0.2435, 0.2616),
+        "train_size": 50_000,
+    },
+    "cifar100": {
+        "factory": datasets.CIFAR100,
+        "mean": (0.5071, 0.4867, 0.4408),
+        "std": (0.2675, 0.2565, 0.2761),
+        "train_size": 50_000,
+    },
+}
+
 
 class EpochSampler(Protocol):
     def set_epoch(self, epoch: int) -> None: ...
@@ -48,34 +63,36 @@ def build_local_dataloaders(
             train_shard_ids=train_shard_ids,
         )
     dataset_name = config.dataset.name.lower()
-    if dataset_name == "cifar100":
-        return _build_cifar100_loaders(resolved, pin_memory)
+    if dataset_name in CIFAR_DATASETS:
+        return _build_cifar_loaders(resolved, pin_memory)
     if dataset_name == "fakedata":
         return _build_fake_data_loaders(resolved, pin_memory)
     raise ValueError(
-        f"Unsupported dataset '{config.dataset.name}'. Available: CIFAR100, FakeData"
+        f"Unsupported dataset '{config.dataset.name}'. Available: CIFAR10, CIFAR100, FakeData"
     )
 
 
-def _build_cifar100_loaders(
+def _build_cifar_loaders(
     resolved: ResolvedConfig, pin_memory: bool
 ) -> DataLoaders:
     config = resolved.training
-    transform_train, transform_eval = _build_cifar100_transforms(config, storage_mode="replicated")
+    dataset_spec = CIFAR_DATASETS[config.dataset.name.lower()]
+    dataset_factory = dataset_spec["factory"]
+    transform_train, transform_eval = _build_cifar_transforms(config, storage_mode="replicated")
 
-    train_dataset_aug = datasets.CIFAR100(
+    train_dataset_aug = dataset_factory(
         root=config.dataset.root,
         train=True,
         download=config.dataset.download,
         transform=transform_train,
     )
-    train_dataset_eval = datasets.CIFAR100(
+    train_dataset_eval = dataset_factory(
         root=config.dataset.root,
         train=True,
         download=False,
         transform=transform_eval,
     )
-    test_dataset = datasets.CIFAR100(
+    test_dataset = dataset_factory(
         root=config.dataset.root,
         train=False,
         download=config.dataset.download,
@@ -165,8 +182,8 @@ def _build_micro_shard_loaders(
             f"{store.manifest.dataset_name} != {config.dataset.name}"
         )
 
-    if config.dataset.name.lower() == "cifar100":
-        train_transform, eval_transform = _build_cifar100_transforms(
+    if config.dataset.name.lower() in CIFAR_DATASETS:
+        train_transform, eval_transform = _build_cifar_transforms(
             config,
             storage_mode="micro_shards",
         )
@@ -176,7 +193,7 @@ def _build_micro_shard_loaders(
         )
     else:
         raise ValueError(
-            f"Unsupported dataset '{config.dataset.name}'. Available: CIFAR100, FakeData"
+            f"Unsupported dataset '{config.dataset.name}'. Available: CIFAR10, CIFAR100, FakeData"
         )
 
     train_dataset = ShardDataset(store, split="train", transform=train_transform)
@@ -238,11 +255,11 @@ def estimate_train_sample_count(config: TrainingConfig) -> int:
     dataset_name = config.dataset.name.lower()
     if dataset_name == "fakedata":
         return config.dataset.fake_train_size
-    if dataset_name == "cifar100":
-        full_train_size = 50_000
+    if dataset_name in CIFAR_DATASETS:
+        full_train_size = CIFAR_DATASETS[dataset_name]["train_size"]
         return full_train_size - int(full_train_size * config.dataset.val_split)
     raise ValueError(
-        f"Unsupported dataset '{config.dataset.name}'. Available: CIFAR100, FakeData"
+        f"Unsupported dataset '{config.dataset.name}'. Available: CIFAR10, CIFAR100, FakeData"
     )
 
 
@@ -304,25 +321,28 @@ def _build_micro_shard_sampler(
     )
 
 
-def _build_cifar100_transforms(
+def _build_cifar_transforms(
     config: TrainingConfig,
     *,
     storage_mode: str,
 ) -> tuple[transforms.Compose, transforms.Compose]:
     image_size = config.dataset.image_size
+    dataset_spec = CIFAR_DATASETS[config.dataset.name.lower()]
+    mean = dataset_spec["mean"]
+    std = dataset_spec["std"]
     if storage_mode == "micro_shards":
         transform_train = transforms.Compose(
             [
                 transforms.RandomCrop(image_size, padding=4),
                 transforms.RandomHorizontalFlip(),
                 transforms.ConvertImageDtype(torch.float32),
-                transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+                transforms.Normalize(mean, std),
             ]
         )
         transform_eval = transforms.Compose(
             [
                 transforms.ConvertImageDtype(torch.float32),
-                transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+                transforms.Normalize(mean, std),
             ]
         )
         return transform_train, transform_eval
@@ -332,13 +352,13 @@ def _build_cifar100_transforms(
             transforms.RandomCrop(image_size, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+            transforms.Normalize(mean, std),
         ]
     )
     transform_eval = transforms.Compose(
         [
             transforms.ToTensor(),
-            transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+            transforms.Normalize(mean, std),
         ]
     )
     return transform_train, transform_eval

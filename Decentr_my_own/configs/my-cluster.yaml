@@ -1,31 +1,31 @@
 cluster:
-  name: decentr-wan-3node
+  name: decentr-wan-cifar10-3node
   overlay: tailscale
-  bootstrap_node: mac
+  bootstrap_node: maxim
 
 nodes:
-  mac:
-    host: 100.110.148.103
+  maxim:
+    host: 100.65.58.88
     port: 55051
     bind_host: 0.0.0.0
     platform: macos
     weight: 1.0
     resources:
       cpu_cores: 8
-      accelerator: mps
+      accelerator: cpu
       relative_speed: 1.2
-  vps1:
-    host: 100.114.132.57
+  polina:
+    host: 100.70.11.4
     port: 55051
     bind_host: 0.0.0.0
-    platform: linux
-    weight: 0.4
+    platform: macos
+    weight: 0.9
     resources:
-      cpu_cores: 2
+      cpu_cores: 8
       accelerator: cpu
-      relative_speed: 0.35
-  vps2:
-    host: 100.84.195.80
+      relative_speed: 1.0
+  vps1:
+    host: 100.114.132.57
     port: 55051
     bind_host: 0.0.0.0
     platform: linux
@@ -50,14 +50,14 @@ training:
   eval_every_epochs: 1
   model:
     name: resnet18
-    num_classes: 100
+    num_classes: 10
     normalization: groupnorm
   dataset:
-    name: CIFAR100
+    name: CIFAR10
     root: ./data
     storage_mode: micro_shards
-    manifest_path: ./artifacts/shards/manifest.json
-    cache_dir: ./artifacts/shards
+    manifest_path: ./artifacts/shards-cifar10/manifest.json
+    cache_dir: ./artifacts/shards-cifar10
     shard_samples: 512
     max_cache_bytes: 2147483648
     prefetch_shards: 0

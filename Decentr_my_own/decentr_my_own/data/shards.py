@@ -15,6 +15,11 @@ from torchvision.transforms import functional as transform_functional
 from decentr_my_own.config.models import TrainingConfig
 from decentr_my_own.data.manifest import DatasetManifest, ShardMeta, SplitName, SplitSummary
 
+CIFAR_DATASETS = {
+    "cifar10": datasets.CIFAR10,
+    "cifar100": datasets.CIFAR100,
+}
+
 
 @dataclass(frozen=True)
 class ShardPayload:
@@ -180,14 +185,15 @@ def build_dataset_shards(
 
 def _build_split_sources(config: TrainingConfig) -> list[_SplitSource]:
     dataset_name = config.dataset.name.lower()
-    if dataset_name == "cifar100":
-        train_dataset = datasets.CIFAR100(
+    if dataset_name in CIFAR_DATASETS:
+        dataset_factory = CIFAR_DATASETS[dataset_name]
+        train_dataset = dataset_factory(
             root=config.dataset.root,
             train=True,
             download=config.dataset.download,
             transform=None,
         )
-        test_dataset = datasets.CIFAR100(
+        test_dataset = dataset_factory(
             root=config.dataset.root,
             train=False,
             download=config.dataset.download,
@@ -260,7 +266,7 @@ def _build_split_sources(config: TrainingConfig) -> list[_SplitSource]:
             ),
         ]
 
-    raise ValueError(f"Unsupported dataset '{config.dataset.name}'. Available: CIFAR100, FakeData")
+    raise ValueError(f"Unsupported dataset '{config.dataset.name}'. Available: CIFAR10, CIFAR100, FakeData")
 
 
 def _split_indices(total_size: int, val_split: float, seed: int) -> tuple[list[int], list[int]]:
