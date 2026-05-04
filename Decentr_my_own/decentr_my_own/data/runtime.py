@@ -11,6 +11,7 @@ from decentr_my_own.config.models import ResolvedConfig
 from decentr_my_own.data.lease_planner import AdaptiveLeasePlanner, build_static_lease_plan
 from decentr_my_own.data.manifest import load_manifest, save_manifest
 from decentr_my_own.data.scheduler_state import LeasePlanRecord, ThroughputReportRecord
+from decentr_my_own.data.shards import build_dataset_shards
 
 _INITIAL_TRANSFER_BACKOFF_S = 0.1
 _MAX_TRANSFER_BACKOFF_S = 1.0
@@ -51,9 +52,7 @@ def prepare_static_micro_shards(
 
     if resolved.self_node_id == bootstrap_node_id:
         if not manifest_path.exists():
-            raise FileNotFoundError(
-                f"Bootstrap node '{resolved.self_node_id}' is missing manifest at {manifest_path}"
-            )
+            build_dataset_shards(config, force=True)
         server.configure_shard_store(manifest_path, base_dir=cache_dir)
         if not server.shard_store.list_local_shards("train"):
             raise RuntimeError(
@@ -387,9 +386,7 @@ class AdaptiveMicroShardRuntime:
 
         if self._is_bootstrap:
             if not manifest_path.exists():
-                raise FileNotFoundError(
-                    f"Bootstrap node '{self.resolved.self_node_id}' is missing manifest at {manifest_path}"
-                )
+                build_dataset_shards(config, force=True)
             self.server.configure_shard_store(manifest_path, base_dir=cache_dir)
             if not self.server.shard_store.list_local_shards("train"):
                 raise RuntimeError(

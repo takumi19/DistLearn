@@ -1,5 +1,5 @@
 cluster:
-  name: decentr-wan-cifar10-4node
+  name: decentr-wan-cifar100-4node
   overlay: tailscale
   bootstrap_node: mac
 
@@ -60,14 +60,14 @@ training:
   eval_every_epochs: 1
   model:
     name: resnet18
-    num_classes: 10
+    num_classes: 100
     normalization: groupnorm
   dataset:
-    name: CIFAR10
+    name: CIFAR100
     root: ./data
     storage_mode: micro_shards
-    manifest_path: ./artifacts/shards-cifar10/manifest.json
-    cache_dir: ./artifacts/shards-cifar10
+    manifest_path: ./artifacts/shards-cifar100/manifest.json
+    cache_dir: ./artifacts/shards-cifar100
     shard_samples: 512
     max_cache_bytes: 2147483648
     prefetch_shards: 0

@@ -23,6 +23,38 @@ from decentr_my_own.data.shards import build_dataset_shards
 
 
 class RuntimePrefetchTests(unittest.TestCase):
+    def test_bootstrap_builds_missing_manifest_for_adaptive_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            cluster_path, training_paths, node_ids = self._write_runtime_configs(
+                tmp_path,
+                prefetch_shards=0,
+            )
+            resolved = load_resolved_config(cluster_path, training_paths[node_ids[0]], node_ids[0])
+            manifest_path = Path(resolved.training.dataset.manifest_path)
+            self.assertFalse(manifest_path.exists())
+
+            server = PeerServer(
+                node_id=node_ids[0],
+                host="127.0.0.1",
+                port=resolved.self_node.port,
+                transfer_chunk_bytes=256,
+            )
+            runtime = AdaptiveMicroShardRuntime(
+                resolved=resolved,
+                server=server,
+                timeout_s=10.0,
+            )
+            try:
+                server.start()
+                shard_ids = runtime.get_window_shard_ids(0)
+                self.assertTrue(shard_ids)
+                self.assertTrue(manifest_path.exists())
+                self.assertTrue(server.shard_store.list_local_shards("train"))
+            finally:
+                runtime.close()
+                server.stop(grace=0.0)
+
     def test_adaptive_prefetch_reduces_wait_for_next_window(self) -> None:
         cold_elapsed, cold_stats = self._measure_window_wait(prefetch_shards=0)
         warm_elapsed, warm_stats = self._measure_window_wait(prefetch_shards=3)
