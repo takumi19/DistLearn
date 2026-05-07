@@ -119,6 +119,10 @@ class AdaptiveLeasePlanner:
     def capacities(self) -> dict[str, float]:
         return dict(self._capacity_ema)
 
+    @property
+    def next_window_id(self) -> int:
+        return self._next_window_id
+
     def _update_feedback(self, reports: list[ThroughputReportRecord]) -> None:
         ema = self.training.dataset.throughput_ema
         report_by_node = {report.node_id: report for report in reports}

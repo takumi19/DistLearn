@@ -55,6 +55,59 @@ class RuntimePrefetchTests(unittest.TestCase):
                 runtime.close()
                 server.stop(grace=0.0)
 
+    def test_bootstrap_generates_future_lease_plan_on_follower_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            cluster_path, training_paths, node_ids = self._write_runtime_configs(
+                tmp_path,
+                prefetch_shards=0,
+            )
+            bootstrap_training = load_training_config(training_paths[node_ids[0]])
+            build_dataset_shards(bootstrap_training)
+
+            servers: dict[str, PeerServer] = {}
+            runtimes: dict[str, AdaptiveMicroShardRuntime] = {}
+            try:
+                for node_id in node_ids:
+                    resolved = load_resolved_config(cluster_path, training_paths[node_id], node_id)
+                    manifest_path = resolved.training.dataset.manifest_path
+                    server = PeerServer(
+                        node_id=node_id,
+                        host="127.0.0.1",
+                        port=resolved.self_node.port,
+                        shard_manifest_path=(
+                            manifest_path
+                            if manifest_path is not None and Path(manifest_path).exists()
+                            else None
+                        ),
+                        transfer_chunk_bytes=256,
+                    )
+                    server.start()
+                    servers[node_id] = server
+                    runtimes[node_id] = AdaptiveMicroShardRuntime(
+                        resolved=resolved,
+                        server=server,
+                        timeout_s=10.0,
+                    )
+
+                bootstrap_shards = runtimes[node_ids[0]].get_window_shard_ids(0)
+                self.assertTrue(bootstrap_shards)
+                self.assertFalse(
+                    servers[node_ids[0]].control_store.get_lease_plan(2).assignments
+                )
+
+                follower_shards = runtimes[node_ids[1]].get_window_shard_ids(2)
+
+                self.assertTrue(follower_shards)
+                future_plan = servers[node_ids[0]].control_store.get_lease_plan(2)
+                self.assertTrue(future_plan.assignments)
+                self.assertEqual(future_plan.window_id, 2)
+            finally:
+                for runtime in runtimes.values():
+                    runtime.close()
+                for server in servers.values():
+                    server.stop(grace=0.0)
+
     def test_adaptive_prefetch_reduces_wait_for_next_window(self) -> None:
         cold_elapsed, cold_stats = self._measure_window_wait(prefetch_shards=0)
         warm_elapsed, warm_stats = self._measure_window_wait(prefetch_shards=3)

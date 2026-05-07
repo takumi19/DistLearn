@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent import futures
 from pathlib import Path
+from typing import Callable
 
 import grpc
 
@@ -21,6 +22,7 @@ from decentr_my_own.comm.state import (
     PeerStateSnapshot,
     PeerStateStore,
 )
+from decentr_my_own.data.scheduler_state import LeasePlanRecord
 from decentr_my_own.data.shard_store import ShardStore
 from decentr_my_own.data.shard_transfer import iter_shard_file_chunks
 
@@ -41,12 +43,14 @@ class PeerTransportServicer(peer_pb2_grpc.PeerTransportServicer):
         shard_store: ShardStore | None = None,
         *,
         transfer_chunk_bytes: int = 1_048_576,
+        lease_plan_provider: Callable[[int], LeasePlanRecord | None] | None = None,
     ):
         self.node_id = node_id
         self.state_store = state_store
         self.control_store = control_store
         self.shard_store = shard_store
         self.transfer_chunk_bytes = transfer_chunk_bytes
+        self.lease_plan_provider = lease_plan_provider
 
     def Ping(self, request, context):
         return peer_pb2.PingReply(
@@ -104,6 +108,15 @@ class PeerTransportServicer(peer_pb2_grpc.PeerTransportServicer):
 
     def GetLeasePlan(self, request, context):
         lease_plan = self.control_store.get_lease_plan(request.window_id)
+        if not lease_plan.assignments and self.lease_plan_provider is not None:
+            try:
+                provided = self.lease_plan_provider(request.window_id)
+            except Exception as exc:
+                context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
+            if provided is not None:
+                lease_plan = provided
+            else:
+                lease_plan = self.control_store.get_lease_plan(request.window_id)
         return peer_pb2.LeasePlanReply(
             receiver_node_id=self.node_id,
             lease_plan=lease_plan_to_proto(lease_plan),
@@ -228,6 +241,12 @@ class PeerServer:
 
     def set_lease_plan(self, lease_plan) -> None:
         self.control_store.set_lease_plan(lease_plan)
+
+    def set_lease_plan_provider(
+        self,
+        provider: Callable[[int], LeasePlanRecord | None] | None,
+    ) -> None:
+        self.servicer.lease_plan_provider = provider
 
     def configure_shard_store(
         self,

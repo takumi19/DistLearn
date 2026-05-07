@@ -231,6 +231,7 @@ class AdaptiveMicroShardRuntime:
     timeout_s: float
     _initialized: bool = False
     _planner: AdaptiveLeasePlanner | None = None
+    _planner_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _state_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _prefetch_task: _PrefetchTask | None = field(default=None, init=False, repr=False)
     _inventory_cache: dict[str, set[str]] = field(default_factory=dict, init=False, repr=False)
@@ -398,8 +399,8 @@ class AdaptiveMicroShardRuntime:
                 self.resolved.training,
                 split="train",
             )
-            initial_plan = self._planner.plan_window(window_id=0)
-            self.server.set_lease_plan(initial_plan)
+            self.server.set_lease_plan_provider(self._provide_bootstrap_lease_plan)
+            self._ensure_leader_plan(0)
         else:
             client = self._bootstrap_client()
             try:
@@ -656,19 +657,35 @@ class AdaptiveMicroShardRuntime:
             return
         if self._planner is None:
             raise RuntimeError("Adaptive planner is not initialized on bootstrap node")
-        if window_id == 0:
-            initial_plan = self._planner.plan_window(window_id=0)
-            self.server.set_lease_plan(initial_plan)
-            self._record_scheduler_window(window_id=0, report=None)
-            return
+        with self._planner_lock:
+            while True:
+                existing = self.server.control_store.get_lease_plan(window_id)
+                if existing.assignments:
+                    return
+                next_window_id = self._planner.next_window_id
+                if next_window_id > window_id:
+                    return
+                if next_window_id == 0:
+                    lease_plan = self._planner.plan_window(window_id=0)
+                else:
+                    # Adaptive epoch planning must not stall on every slow follower. Use
+                    # whatever reports arrived for the previous window and keep the
+                    # existing EMA for nodes that have not reported yet. This also lets
+                    # fast followers request future windows before the bootstrap worker
+                    # reaches them locally.
+                    reports = self.server.get_throughput_reports(window_id=next_window_id - 1)
+                    lease_plan = self._planner.plan_window(
+                        window_id=next_window_id,
+                        reports=reports,
+                    )
+                self.server.set_lease_plan(lease_plan)
+                self._record_scheduler_window(window_id=next_window_id, report=None)
 
-        # Adaptive epoch planning must not stall on every slow follower. Use whatever
-        # reports arrived for the previous epoch and keep the existing EMA for nodes
-        # that have not reported yet.
-        reports = self.server.get_throughput_reports(window_id=window_id - 1)
-        lease_plan = self._planner.plan_window(window_id=window_id, reports=reports)
-        self.server.set_lease_plan(lease_plan)
-        self._record_scheduler_window(window_id=window_id, report=None)
+    def _provide_bootstrap_lease_plan(self, window_id: int) -> LeasePlanRecord:
+        if not self._is_bootstrap:
+            return self.server.control_store.get_lease_plan(window_id)
+        self._ensure_leader_plan(window_id)
+        return self.server.control_store.get_lease_plan(window_id)
 
     def _record_scheduler_window(
         self,
