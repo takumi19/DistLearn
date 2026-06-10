@@ -1,0 +1,22 @@
+# ── Terraform: provider binaries (huge) + state & real vars (sensitive infra) ──
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+*.tfplan
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+
+# ── Campaign outputs / run artifacts (regenerated, not source) ──
+results/
+artifacts/
+logs/
+campaign-state/
+*.pt
+*.log
+
+# ── OS ──
+.DS_Store

@@ -1,0 +1,132 @@
+#cloud-config
+# cloud-init.yaml.template — bootstrap for the manual / Tailscale path.
+#
+# Use this when nodes are on different networks (WAN, different providers).
+# For Terraform/Selectel private subnet use:
+#   provision/terraform/cloud-init.subnet.yaml.template
+#
+# Render with:
+#   python3 render_cloud_init.py \
+#     --template cloud-init.yaml.template \
+#     --out cloud-init.rendered.yaml
+
+users:
+  - name: decentr
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - "{{ORCHESTRATOR_SSH_PUBKEY}}"
+
+preserve_hostname: false
+
+package_update: true
+package_upgrade: false
+packages:
+  - git
+  - curl
+  - ca-certificates
+  - build-essential
+  - rsync
+  - python3.12
+  - python3.12-venv
+  - python3.12-dev
+  - python3-pip
+  - ufw
+
+write_files:
+  - path: /home/decentr/.ssh/results_deploy_key
+    owner: decentr:decentr
+    permissions: '0600'
+    content: |
+      {{RESULTS_DEPLOY_KEY_INDENTED}}
+
+  - path: /home/decentr/.ssh/project_deploy_key
+    owner: decentr:decentr
+    permissions: '0600'
+    content: |
+      {{PROJECT_DEPLOY_KEY_INDENTED}}
+
+  - path: /home/decentr/.ssh/config
+    owner: decentr:decentr
+    permissions: '0600'
+    content: |
+      Host {{RESULTS_REPO_HOST}}
+        IdentityFile /home/decentr/.ssh/results_deploy_key
+        IdentitiesOnly yes
+        StrictHostKeyChecking accept-new
+      Host {{PROJECT_REPO_HOST}}
+        IdentityFile /home/decentr/.ssh/project_deploy_key
+        IdentitiesOnly yes
+        StrictHostKeyChecking accept-new
+
+  - path: /opt/decentr/.bootstrap.in_progress
+    content: "bootstrap started"
+    permissions: '0644'
+
+  - path: /opt/decentr/bootstrap.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      export HOME=/home/decentr
+      cd /opt/decentr
+
+      # ── Idempotency guard ────────────────────────────────────────────────────
+      # runcmd runs on every VM start in YC cloud-init. Exit fast if already done.
+      if [[ -f /opt/decentr/.bootstrap.done ]]; then
+        echo "bootstrap already done, skipping" >> /opt/decentr/bootstrap.log
+        exit 0
+      fi
+
+      # ── Firewall first — open SSH immediately so port 22 stays accessible ───
+      # Must come before any long-running operations (tailscale, pip, git clone).
+      ufw --force enable
+      ufw allow 22/tcp
+      ufw allow 50051/tcp
+      ufw allow 50052/tcp
+
+      # Install Tailscale
+      curl -fsSL https://tailscale.com/install.sh | sh
+      tailscale up --authkey "{{TAILSCALE_AUTH_KEY}}" --hostname "$(hostname)" --accept-routes
+
+      # Project clone
+      if [[ -s /home/decentr/.ssh/project_deploy_key ]]; then
+        GIT_SSH_COMMAND="ssh -i /home/decentr/.ssh/project_deploy_key -o StrictHostKeyChecking=accept-new" \
+          git clone --branch "{{PROJECT_REPO_BRANCH}}" "{{PROJECT_REPO_URL}}" Decentr_my_own
+      else
+        HTTPS_URL=$(echo "{{PROJECT_REPO_URL}}" | sed -E 's#git@([^:]+):#https://\1/#')
+        git clone --branch "{{PROJECT_REPO_BRANCH}}" "$HTTPS_URL" Decentr_my_own
+      fi
+
+      # Results repo
+      GIT_SSH_COMMAND="ssh -i /home/decentr/.ssh/results_deploy_key -o StrictHostKeyChecking=accept-new" \
+        git clone "{{RESULTS_REPO_URL}}" decentr-results || {
+          mkdir -p decentr-results && cd decentr-results && git init && \
+          git remote add origin "{{RESULTS_REPO_URL}}" && cd ..
+        }
+      cd decentr-results
+      git config user.name "{{RESULTS_GIT_NAME}}"
+      git config user.email "{{RESULTS_GIT_EMAIL}}"
+      cd ..
+
+      # Python env + project install
+      python3.12 -m venv venv
+      ./venv/bin/pip install --upgrade pip wheel
+      ./venv/bin/pip install -e ./Decentr_my_own
+
+      # Pre-download CIFAR10
+      ./venv/bin/python -c "
+      from torchvision import datasets
+      datasets.CIFAR10('./Decentr_my_own/data', train=True,  download=True)
+      datasets.CIFAR10('./Decentr_my_own/data', train=False, download=True)
+      "
+
+      mv /opt/decentr/.bootstrap.in_progress /opt/decentr/.bootstrap.done
+      echo "bootstrap finished at $(date -Is)" >> /opt/decentr/bootstrap.log
+
+runcmd:
+  - mkdir -p /opt/decentr
+  - chown -R decentr:decentr /opt/decentr /home/decentr/.ssh
+  - su - decentr -c "nohup bash /opt/decentr/bootstrap.sh > /opt/decentr/bootstrap.log 2>&1 &"
+
+final_message: "decentr cloud-init done. bootstrap.sh running — poll /opt/decentr/.bootstrap.done."

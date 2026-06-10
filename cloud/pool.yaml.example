@@ -1,0 +1,106 @@
+# pool.yaml.example — copy to pool.yaml and fill in real IPs.
+# pool.yaml is gitignored; pool.yaml.example is tracked.
+#
+# In Terraform/subnet mode pool.yaml is generated automatically by
+#   terraform apply  (via templates/pool.yaml.tftpl).
+# You only need to hand-edit this for manual provisioning.
+
+pool_id: selectel-ru9-20240601
+provider: selectel
+
+defaults:
+  ssh_user: decentr
+  ssh_port: 22
+  ssh_key_path: ~/.ssh/decentr_id_ed25519
+  port: 50051          # gRPC port on each node
+  bind_host: 0.0.0.0
+  platform: linux
+  project_dir: /opt/decentr/DistLearn/Decentr_my_own
+  python_env: /opt/decentr/venv
+  results_dir: /opt/decentr/decentr-results
+  weight: 1.0
+  cpu_cores: 4
+  relative_speed: 1.0
+
+# host     = private subnet IP — used by nodes to talk to each other (gRPC)
+# ssh_host = floating / public IP — used by the orchestrator to SSH in
+nodes:
+  - id: decentr-01
+    host: 10.0.0.11
+    ssh_host: 185.10.20.101
+
+  - id: decentr-02
+    host: 10.0.0.12
+    ssh_host: 185.10.20.102
+
+  - id: decentr-03
+    host: 10.0.0.13
+    ssh_host: 185.10.20.103
+
+  - id: decentr-04
+    host: 10.0.0.14
+    ssh_host: 185.10.20.104
+
+  - id: decentr-05
+    host: 10.0.0.15
+    ssh_host: 185.10.20.105
+
+  - id: decentr-06
+    host: 10.0.0.16
+    ssh_host: 185.10.20.106
+
+  - id: decentr-07
+    host: 10.0.0.17
+    ssh_host: 185.10.20.107
+
+  - id: decentr-08
+    host: 10.0.0.18
+    ssh_host: 185.10.20.108
+
+  - id: decentr-09
+    host: 10.0.0.19
+    ssh_host: 185.10.20.109
+
+  - id: decentr-10
+    host: 10.0.0.20
+    ssh_host: 185.10.20.110
+
+  - id: decentr-11
+    host: 10.0.0.21
+    ssh_host: 185.10.20.111
+
+  - id: decentr-12
+    host: 10.0.0.22
+    ssh_host: 185.10.20.112
+
+  - id: decentr-13
+    host: 10.0.0.23
+    ssh_host: 185.10.20.113
+
+  - id: decentr-14
+    host: 10.0.0.24
+    ssh_host: 185.10.20.114
+
+  - id: decentr-15
+    host: 10.0.0.25
+    ssh_host: 185.10.20.115
+
+  - id: decentr-16
+    host: 10.0.0.26
+    ssh_host: 185.10.20.116
+
+  - id: decentr-17
+    host: 10.0.0.27
+    ssh_host: 185.10.20.117
+
+  - id: decentr-18
+    host: 10.0.0.28
+    ssh_host: 185.10.20.118
+
+  - id: decentr-19
+    host: 10.0.0.29
+    ssh_host: 185.10.20.119
+
+  - id: decentr-20
+    host: 10.0.0.30
+    ssh_host: 185.10.20.120

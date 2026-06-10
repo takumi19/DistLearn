@@ -1,0 +1,136 @@
+#cloud-config
+# cloud-init.yc.yaml.template — bootstrap for Yandex Cloud VMs.
+#
+# Nodes communicate over the private VPC subnet (no Tailscale needed).
+# Outbound internet (apt, git clone, CIFAR-10) comes from the shared NAT gateway.
+# Security is handled by the Yandex Cloud security group — no ufw needed.
+#
+# Render with (run from the terraform-yc/ directory):
+#   python3 ../../../render_cloud_init.py \
+#     --template cloud-init.yc.yaml.template \
+#     --out cloud-init.rendered.yaml
+
+users:
+  - name: decentr
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - "{{ORCHESTRATOR_SSH_PUBKEY}}"
+
+preserve_hostname: false
+
+package_update: true
+package_upgrade: false
+packages:
+  - openssh-server
+  - git
+  - curl
+  - ca-certificates
+  - build-essential
+  - rsync
+  - python3.12
+  - python3.12-venv
+  - python3.12-dev
+  - python3-pip
+
+write_files:
+  # NOTE: no 'owner:' here — write_files runs before the 'decentr' user is created.
+  # getpwnam('decentr') would fail, crashing the entire write_files module and leaving
+  # ALL files unwritten. Instead we create files as root and chown in runcmd.
+  - path: /home/decentr/.ssh/results_deploy_key
+    permissions: '0600'
+    content: |
+{{RESULTS_DEPLOY_KEY_INDENTED}}
+
+  - path: /home/decentr/.ssh/project_deploy_key
+    permissions: '0600'
+    content: |
+{{PROJECT_DEPLOY_KEY_INDENTED}}
+
+  - path: /home/decentr/.ssh/config
+    permissions: '0600'
+    content: |
+      Host {{RESULTS_REPO_HOST}}
+        IdentityFile /home/decentr/.ssh/results_deploy_key
+        IdentitiesOnly yes
+        StrictHostKeyChecking accept-new
+      Host {{PROJECT_REPO_HOST}}
+        IdentityFile /home/decentr/.ssh/project_deploy_key
+        IdentitiesOnly yes
+        StrictHostKeyChecking accept-new
+
+  - path: /opt/decentr/.bootstrap.in_progress
+    content: "bootstrap started"
+    permissions: '0644'
+
+  - path: /opt/decentr/bootstrap.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      export HOME=/home/decentr
+      cd /opt/decentr
+
+      # Project clone: SSH key if provided (private repo), else HTTPS (public).
+      if [[ -s /home/decentr/.ssh/project_deploy_key ]]; then
+        GIT_SSH_COMMAND="ssh -i /home/decentr/.ssh/project_deploy_key -o StrictHostKeyChecking=accept-new" \
+          git clone --branch "{{PROJECT_REPO_BRANCH}}" "{{PROJECT_REPO_URL}}" DistLearn
+      else
+        HTTPS_URL=$(echo "{{PROJECT_REPO_URL}}" | sed -E 's#git@([^:]+):#https://\1/#')
+        git clone --branch "{{PROJECT_REPO_BRANCH}}" "$HTTPS_URL" DistLearn
+      fi
+
+      # Results repo clone (init locally if remote is empty).
+      GIT_SSH_COMMAND="ssh -i /home/decentr/.ssh/results_deploy_key -o StrictHostKeyChecking=accept-new" \
+        git clone "{{RESULTS_REPO_URL}}" decentr-results || {
+          mkdir -p decentr-results && cd decentr-results && git init && \
+          git remote add origin "{{RESULTS_REPO_URL}}" && cd ..
+        }
+      cd decentr-results
+      git config user.name "{{RESULTS_GIT_NAME}}"
+      git config user.email "{{RESULTS_GIT_EMAIL}}"
+      cd ..
+
+      # Python env + project install.
+      python3.12 -m venv venv
+      ./venv/bin/pip install --upgrade pip wheel
+      ./venv/bin/pip install -e ./DistLearn/Decentr_my_own
+
+      # Pre-download CIFAR-10 so the first run doesn't race on slow internet.
+      ./venv/bin/python -c "
+      from torchvision import datasets
+      datasets.CIFAR10('./DistLearn/Decentr_my_own/data', train=True, download=True)
+      datasets.CIFAR10('./DistLearn/Decentr_my_own/data', train=False, download=True)
+      "
+
+      mv /opt/decentr/.bootstrap.in_progress /opt/decentr/.bootstrap.done
+      echo "bootstrap finished at $(date -Is)" >> /opt/decentr/bootstrap.log
+
+runcmd:
+  # 1. Kill UFW completely — both service and iptables/nftables rules.
+  - systemctl stop ufw || true
+  - systemctl disable ufw || true
+  - systemctl mask ufw || true
+  # 2. Flush ALL firewall rules (iptables + nftables backend on Ubuntu 24.04).
+  - iptables -P INPUT ACCEPT || true
+  - iptables -P FORWARD ACCEPT || true
+  - iptables -P OUTPUT ACCEPT || true
+  - iptables -F || true
+  - iptables -X || true
+  - ip6tables -P INPUT ACCEPT || true
+  - ip6tables -F || true
+  - nft flush ruleset || true
+  # 3. Stop ssh.socket (socket-activation unit) so sshd can bind port 22 itself.
+  #    Without this, ssh.socket holds port 22 and ssh.service/sshd fails to bind.
+  - systemctl stop ssh.socket || true
+  - systemctl disable ssh.socket || true
+  - systemctl mask ssh.socket || true
+  # 4. Start sshd in daemon mode (not socket-activated).
+  - systemctl unmask ssh.service || true
+  - systemctl enable ssh.service || true
+  - systemctl restart ssh.service || true
+  - mkdir -p /opt/decentr
+  - chown -R decentr:decentr /opt/decentr /home/decentr/.ssh
+  - su - decentr -c "nohup bash /opt/decentr/bootstrap.sh > /opt/decentr/bootstrap.log 2>&1 &"
+
+final_message: "decentr yc cloud-init done. bootstrap.sh running — poll /opt/decentr/.bootstrap.done."

@@ -1,0 +1,1846 @@
+from __future__ import annotations
+
+import multiprocessing as mp
+import socket
+import tempfile
+import time
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+
+import grpc
+import torch
+import torch.nn as nn
+import yaml
+
+from decentr_my_own.algorithms.communication_policy import (
+    PeerScoreTracker,
+    select_push_neighbors,
+)
+from decentr_my_own.comm.client import PeerClient
+from decentr_my_own.comm.messages import PayloadMetadata, PeerPayload
+from decentr_my_own.comm.server import PeerServer
+from decentr_my_own.config.loader import load_resolved_config, load_yaml
+from decentr_my_own.config.models import ResolvedConfig
+from decentr_my_own.data.runtime import AdaptiveMicroShardRuntime, prepare_static_micro_shards
+from decentr_my_own.data.loaders import build_local_dataloaders
+from decentr_my_own.data.manifest import load_manifest, save_manifest
+from decentr_my_own.data.scheduler_state import RunCompletionRecord
+from decentr_my_own.data.shards import build_dataset_shards
+from decentr_my_own.models.factory import build_model
+from decentr_my_own.training.device import select_device
+from decentr_my_own.training.io import (
+    create_run_directories,
+    safe_rate,
+    utc_now_iso,
+    write_metrics,
+    write_summary,
+)
+from decentr_my_own.training.metrics import (
+    init_confusion_matrix,
+    macro_f1_from_confusion,
+    summarize_classification_metrics,
+    update_confusion_matrix,
+)
+from decentr_my_own.training.seed import set_global_seed
+from decentr_my_own.training.state_ops import (
+    check_state_finite,
+    digest_state,
+    extract_model_state,
+    load_model_state,
+    require_state_finite,
+)
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_CONTROL_RPC_ATTEMPT_TIMEOUT_S = 30.0
+_PUSH_PREFLIGHT_TIMEOUT_S = 5.0
+_MIN_RPC_TIMEOUT_S = 0.5
+
+
+@dataclass(frozen=True)
+class PushAttemptResult:
+    ok: bool
+    target: str
+    elapsed_s: float
+    error_type: str | None = None
+    error_message: str | None = None
+    num_bytes: int = 0
+
+
+@dataclass
+class DeltaExchangeState:
+    """Per-run mutable state for delta-mode weight exchange.
+
+    ``last_sent`` is None until the first successful push; thereafter it holds
+    the model state dict that was last successfully pushed.
+    ``reconstructions`` maps each sender_id to the last fully-reconstructed
+    state for that sender, used as the base when applying incoming deltas.
+    """
+    last_sent: dict | None = None
+    reconstructions: dict = None
+
+    def __post_init__(self) -> None:
+        if self.reconstructions is None:
+            self.reconstructions = {}
+
+
+@dataclass
+class AsyncRunOverrides:
+    epochs: int | None = None
+    rounds: int | None = None
+    max_local_batches: int | None = None
+    max_eval_batches: int | None = None
+    run_name: str | None = None
+    transport_timeout_s: float = 15.0
+    bind_host: str | None = None
+    round_delay_s: float = 0.0
+    shutdown_grace_s: float = 2.0
+    serve_config: bool = False  # start HTTP config server so followers can join without a token
+
+
+def run_async_worker(
+    resolved: ResolvedConfig, overrides: AsyncRunOverrides | None = None
+) -> dict:
+    overrides = overrides or AsyncRunOverrides()
+    config = resolved.training
+    epoch_count = _resolve_async_epoch_count(config, overrides)
+    started_at = utc_now_iso()
+    run_started_perf = time.perf_counter()
+    set_global_seed(config.seed)
+    device = select_device([str(item) for item in config.device_preference])
+    pin_memory = device.type == "cuda"
+
+    run_id, log_dir, checkpoint_dir = create_run_directories(
+        config.logging.log_dir,
+        config.logging.checkpoint_dir,
+        resolved.self_node_id,
+        overrides.run_name,
+    )
+    model = build_model(config.model).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=config.optimization.lr,
+        momentum=config.optimization.momentum,
+        weight_decay=config.optimization.weight_decay,
+    )
+
+    server = PeerServer(
+        node_id=resolved.self_node_id,
+        host=overrides.bind_host or resolved.self_node.bind_host,
+        port=resolved.self_node.port,
+        shard_manifest_path=(
+            config.dataset.manifest_path
+            if config.dataset.storage_mode == "micro_shards"
+            and config.dataset.manifest_path is not None
+            and Path(config.dataset.manifest_path).exists()
+            else None
+        ),
+        transfer_chunk_bytes=config.dataset.transfer_chunk_bytes,
+    )
+    server.start()
+    neighbors = [resolved.cluster.get_node(node_id) for node_id in resolved.self_node.neighbors]
+    # Peer-score tracker for communication policies (Phase 2). Lives for the whole
+    # run; seeded with each neighbour's compute capacity. For policy="full" it is
+    # populated but never consulted, so default runs are unaffected.
+    score_tracker = PeerScoreTracker(
+        success_alpha=config.async_config.peer_score_alpha,
+        latency_alpha=config.async_config.peer_score_alpha,
+        usefulness_alpha=config.async_config.peer_score_alpha,
+    )
+    for neighbor in neighbors:
+        score_tracker.seed_capacity(neighbor.id, neighbor.resources.relative_speed)
+    # ── Phase 3 state (delta exchange / dynamic graph) ────────────────────────
+    delta_state = (
+        DeltaExchangeState()
+        if config.async_config.payload_mode == "delta"
+        else None
+    )
+    total_window_count = 0
+    # active_neighbors is the dynamic push set; starts as the full static graph
+    # and is rebuilt by the dynamic_graph policy. Receiving still uses all ids.
+    active_neighbors = list(neighbors)
+    all_neighbor_ids = [neighbor.id for neighbor in neighbors]
+    adaptive_runtime = None
+    static_shard_ids: list[str] | None = None
+
+    config_http_server = None
+    if overrides.serve_config:
+        from decentr_my_own.comm.config_server import RunConfigServer, config_port_for
+        _bootstrap_nid = resolved.cluster.bootstrap_node_id or resolved.self_node_id
+        if resolved.self_node_id == _bootstrap_nid:
+            _cfg_payload = {
+                "cluster": resolved.cluster.model_dump(),
+                "training": resolved.training.model_dump(by_alias=True),
+                "run_name": overrides.run_name,
+                "epochs": epoch_count,
+            }
+            config_http_server = RunConfigServer(
+                host=overrides.bind_host or resolved.self_node.bind_host,
+                port=config_port_for(resolved.self_node.port),
+                payload=_cfg_payload,
+            )
+            config_http_server.start()
+
+    try:
+        _wait_for_neighbors(
+            self_node_id=resolved.self_node_id,
+            neighbors=neighbors,
+            timeout_s=overrides.transport_timeout_s,
+        )
+        if (
+            config.dataset.storage_mode == "micro_shards"
+            and config.dataset.scheduler_mode == "adaptive"
+        ):
+            adaptive_runtime = AdaptiveMicroShardRuntime(
+                resolved=resolved,
+                server=server,
+                timeout_s=overrides.transport_timeout_s,
+            )
+        else:
+            static_shard_ids = prepare_static_micro_shards(
+                resolved,
+                server,
+                timeout_s=overrides.transport_timeout_s,
+                window_id=0,
+            )
+        dataloaders = None
+
+        metrics_ext = "json" if config.logging.metrics_format == "json" else "csv"
+        epoch_history = []
+        mixed_peer_updates_total = 0
+        dropped_peer_updates_total = 0
+        nonfinite_peer_updates_total = 0
+        max_observed_staleness = 0
+        max_observed_normalized_staleness = 0.0
+        stale_mixed_peer_updates_total = 0
+        hard_dropped_stale_peer_updates_total = 0
+        failed_pushes_total = 0
+        push_count_total = 0
+        push_elapsed_s_total = 0.0
+        push_failed_targets_total: set[str] = set()
+        push_failure_reasons_total: list[str] = []
+        local_step = 0
+        last_mixed_payload_ids: dict[str, str] = {}
+        final_test_metrics = {"loss": 0.0, "accuracy": 0.0, "macro_f1": 0.0}
+        next_adaptive_window_id = 0
+
+        for epoch_idx in range(epoch_count):
+            epoch_started_perf = time.perf_counter()
+            epoch_train_accumulator = _init_train_accumulator(config.model.num_classes)
+            epoch_mixed_peer_updates = 0
+            epoch_failed_pushes = 0
+            epoch_push_count = 0
+            epoch_push_elapsed_s = 0.0
+            epoch_push_failed_targets: set[str] = set()
+            epoch_push_failure_reasons: list[str] = []
+            epoch_max_staleness = 0
+            epoch_max_normalized_staleness = 0.0
+            epoch_stale_mixed_peer_updates = 0
+            epoch_hard_dropped_stale_peer_updates = 0
+            epoch_mixed_senders: set[str] = set()
+            epoch_dropped_peer_updates = 0
+            epoch_nonfinite_peer_updates = 0
+            epoch_dropped_peer_senders: set[str] = set()
+            epoch_drop_reasons: list[str] = []
+            epoch_window_count = 0
+            epoch_window_rows: list[dict[str, int | float]] = []
+
+            while True:
+                window_assignment = None
+                if adaptive_runtime is not None:
+                    window_assignment = adaptive_runtime.get_window_assignment(next_adaptive_window_id)
+                    if window_assignment.epoch_id != epoch_idx:
+                        raise RuntimeError(
+                            "Adaptive runtime returned mismatched epoch window: "
+                            f"expected epoch_id={epoch_idx}, got {window_assignment.epoch_id}"
+                        )
+                    train_shard_ids = window_assignment.shard_ids
+                else:
+                    train_shard_ids = static_shard_ids
+
+                dataloaders = build_local_dataloaders(
+                    resolved,
+                    pin_memory=pin_memory,
+                    train_shard_ids=train_shard_ids,
+                )
+                if dataloaders.train_sampler is not None:
+                    dataloaders.train_sampler.set_epoch(epoch_idx)
+
+                train_started_perf = time.perf_counter()
+                train_metrics = _train_async_window(
+                    model,
+                    dataloaders.train,
+                    optimizer,
+                    criterion,
+                    device,
+                    num_classes=config.model.num_classes,
+                    max_batches=overrides.max_local_batches,
+                    start_step=local_step,
+                    run_id=run_id,
+                    self_node_id=resolved.self_node_id,
+                    server=server,
+                    neighbors=active_neighbors,
+                    push_fanout=config.async_config.push_fanout,
+                    push_interval_steps=config.async_config.push_interval_steps,
+                    base_alpha=config.async_config.mixing_alpha,
+                    max_staleness=config.async_config.max_staleness,
+                    local_relative_speed=resolved.self_node.resources.relative_speed,
+                    peer_relative_speeds={
+                        neighbor.id: neighbor.resources.relative_speed for neighbor in neighbors
+                    },
+                    gradient_clip_norm=config.optimization.gradient_clip_norm,
+                    transport_timeout_s=overrides.transport_timeout_s,
+                    last_mixed_payload_ids=last_mixed_payload_ids,
+                    communication_policy=config.async_config.communication_policy,
+                    score_tracker=score_tracker,
+                    delta_state=delta_state,
+                    compression=config.async_config.compression,
+                    topk_fraction=config.async_config.topk_fraction,
+                    all_neighbor_ids=all_neighbor_ids,
+                )
+                local_step = train_metrics["last_step"]
+                if overrides.round_delay_s > 0:
+                    time.sleep(overrides.round_delay_s)
+                train_duration_s = time.perf_counter() - train_started_perf
+
+                if adaptive_runtime is not None and window_assignment is not None:
+                    adaptive_runtime.report_window(
+                        window_id=window_assignment.window_id,
+                        samples_processed=train_metrics["samples_processed"],
+                        duration_s=train_duration_s,
+                    )
+                    epoch_window_rows.append(
+                        {
+                            "window_id": window_assignment.window_id,
+                            "epoch_window_index": window_assignment.epoch_window_index,
+                            "epoch_window_count": window_assignment.epoch_window_count,
+                            "assigned_shard_count": len(window_assignment.shard_ids),
+                            "samples_processed": train_metrics["samples_processed"],
+                            "duration_s": train_duration_s,
+                        }
+                    )
+                    next_adaptive_window_id += 1
+
+                _accumulate_train_metrics(epoch_train_accumulator, train_metrics)
+                epoch_mixed_peer_updates += train_metrics["mixed_peer_updates"]
+                epoch_failed_pushes += train_metrics["failed_pushes"]
+                epoch_push_count += train_metrics["pushes_sent"]
+                epoch_push_elapsed_s += float(train_metrics["push_elapsed_s"])
+                epoch_push_failed_targets.update(train_metrics["push_failed_targets"])
+                epoch_push_failure_reasons.extend(train_metrics["push_failure_reasons"])
+                epoch_max_staleness = max(epoch_max_staleness, train_metrics["max_staleness"])
+                epoch_max_normalized_staleness = max(
+                    epoch_max_normalized_staleness,
+                    float(train_metrics["max_normalized_staleness"]),
+                )
+                epoch_stale_mixed_peer_updates += train_metrics["stale_mixed_peer_updates"]
+                epoch_hard_dropped_stale_peer_updates += train_metrics[
+                    "hard_dropped_stale_peer_updates"
+                ]
+                epoch_mixed_senders.update(train_metrics["mixed_senders"])
+                epoch_dropped_peer_updates += train_metrics["dropped_peer_updates"]
+                epoch_nonfinite_peer_updates += train_metrics["nonfinite_peer_updates"]
+                epoch_dropped_peer_senders.update(train_metrics["dropped_peer_senders"])
+                epoch_drop_reasons.extend(train_metrics["drop_reasons"])
+                epoch_window_count += 1
+                total_window_count += 1
+
+                # ── Dynamic graph: periodically rebuild the active push set ───
+                if (
+                    config.async_config.communication_policy == "dynamic"
+                    and config.async_config.dynamic_graph_rebuild_windows > 0
+                    and total_window_count % config.async_config.dynamic_graph_rebuild_windows == 0
+                ):
+                    min_degree = max(
+                        config.async_config.dynamic_graph_min_degree,
+                        config.async_config.push_fanout,
+                    )
+                    ranked = sorted(
+                        neighbors,
+                        key=lambda n: (-score_tracker.score(n.id, "ping_aware"), n.id),
+                    )
+                    active_neighbors = (
+                        ranked[:min_degree] if len(ranked) >= min_degree else ranked
+                    )
+
+                if adaptive_runtime is not None and window_assignment is not None:
+                    if not window_assignment.is_last_window_for_epoch:
+                        adaptive_runtime.schedule_prefetch(next_adaptive_window_id)
+                        continue
+                break
+
+            train_metrics = _finalize_train_metrics(epoch_train_accumulator)
+
+            should_eval = (epoch_idx + 1) % config.optimization.eval_every_epochs == 0
+            val_metrics = (
+                _evaluate(
+                    model,
+                    dataloaders.val,
+                    criterion,
+                    device,
+                    num_classes=config.model.num_classes,
+                    max_batches=overrides.max_eval_batches,
+                )
+                if should_eval
+                else {"loss": None, "accuracy": None, "macro_f1": None}
+            )
+            final_test_metrics = _evaluate(
+                model,
+                dataloaders.test,
+                criterion,
+                device,
+                num_classes=config.model.num_classes,
+                max_batches=overrides.max_eval_batches,
+            )
+
+            mixed_peer_updates_total += epoch_mixed_peer_updates
+            dropped_peer_updates_total += epoch_dropped_peer_updates
+            nonfinite_peer_updates_total += epoch_nonfinite_peer_updates
+            failed_pushes_total += epoch_failed_pushes
+            push_count_total += epoch_push_count
+            push_elapsed_s_total += epoch_push_elapsed_s
+            push_failed_targets_total.update(epoch_push_failed_targets)
+            push_failure_reasons_total.extend(epoch_push_failure_reasons)
+            max_observed_staleness = max(max_observed_staleness, epoch_max_staleness)
+            max_observed_normalized_staleness = max(
+                max_observed_normalized_staleness,
+                epoch_max_normalized_staleness,
+            )
+            stale_mixed_peer_updates_total += epoch_stale_mixed_peer_updates
+            hard_dropped_stale_peer_updates_total += epoch_hard_dropped_stale_peer_updates
+            state_digest = digest_state(extract_model_state(model))
+            epoch_row = {
+                "epoch": epoch_idx + 1,
+                "local_train_loss": train_metrics["loss"],
+                "local_train_accuracy": train_metrics["accuracy"],
+                "local_train_macro_f1": train_metrics["macro_f1"],
+                "samples_processed": train_metrics["samples_processed"],
+                "duration_s": time.perf_counter() - epoch_started_perf,
+                "mixed_peer_updates": epoch_mixed_peer_updates,
+                "mixed_senders": sorted(epoch_mixed_senders),
+                "dropped_peer_updates": epoch_dropped_peer_updates,
+                "dropped_peer_senders": sorted(epoch_dropped_peer_senders),
+                "drop_reasons": epoch_drop_reasons,
+                "nonfinite_peer_updates": epoch_nonfinite_peer_updates,
+                "max_staleness": epoch_max_staleness,
+                "max_normalized_staleness": epoch_max_normalized_staleness,
+                "stale_mixed_peer_updates": epoch_stale_mixed_peer_updates,
+                "hard_dropped_stale_peer_updates": epoch_hard_dropped_stale_peer_updates,
+                "pushes_sent": epoch_push_count,
+                "failed_pushes_total": failed_pushes_total,
+                "push_elapsed_s": epoch_push_elapsed_s,
+                "push_failed_targets": sorted(epoch_push_failed_targets),
+                "push_failure_reasons": epoch_push_failure_reasons,
+                "window_count": epoch_window_count,
+                "val_loss": val_metrics["loss"],
+                "val_accuracy": val_metrics["accuracy"],
+                "val_macro_f1": val_metrics["macro_f1"],
+                "test_loss": final_test_metrics["loss"],
+                "test_accuracy": final_test_metrics["accuracy"],
+                "test_macro_f1": final_test_metrics["macro_f1"],
+                "state_digest": state_digest,
+                "last_step": local_step,
+            }
+            if epoch_window_rows:
+                epoch_row["windows"] = epoch_window_rows
+            epoch_row["samples_per_s"] = safe_rate(
+                epoch_row["samples_processed"], epoch_row["duration_s"]
+            )
+            epoch_history.append(epoch_row)
+
+            # Flush metrics after every epoch so crashes don't lose history.
+            write_metrics(
+                log_dir / f"async_epoch_metrics.{metrics_ext}",
+                epoch_history,
+                config.logging.metrics_format,
+            )
+            if adaptive_runtime is not None:
+                _sched_hist = adaptive_runtime.scheduler_history()
+                if _sched_hist:
+                    write_metrics(log_dir / "scheduler_history.csv", _sched_hist, "csv")
+
+            if (epoch_idx + 1) % config.logging.save_every_round == 0:
+                torch.save(
+                    {
+                        "epoch": epoch_idx + 1,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "metrics": epoch_row,
+                        "self_node_id": resolved.self_node_id,
+                    },
+                    checkpoint_dir / f"async-epoch-{epoch_idx + 1:03d}.pt",
+                )
+
+        write_metrics(
+            log_dir / f"async_epoch_metrics.{metrics_ext}",
+            epoch_history,
+            config.logging.metrics_format,
+        )
+        run_duration_s = time.perf_counter() - run_started_perf
+        total_samples_processed = sum(row["samples_processed"] for row in epoch_history)
+        best_val_accuracy = max(
+            (
+                row["val_accuracy"]
+                for row in epoch_history
+                if row.get("val_accuracy") is not None
+            ),
+            default=None,
+        )
+        best_val_macro_f1 = max(
+            (
+                row["val_macro_f1"]
+                for row in epoch_history
+                if row.get("val_macro_f1") is not None
+            ),
+            default=None,
+        )
+        data_plane_stats = adaptive_runtime.stats() if adaptive_runtime is not None else None
+        scheduler_history_path = None
+        if adaptive_runtime is not None:
+            scheduler_history = adaptive_runtime.scheduler_history()
+            scheduler_history_path = log_dir / "scheduler_history.csv"
+            write_metrics(scheduler_history_path, scheduler_history, "csv")
+        final_state_digest = epoch_history[-1]["state_digest"] if epoch_history else None
+        completion_status = _coordinate_run_completion(
+            resolved=resolved,
+            server=server,
+            completion=RunCompletionRecord(
+                node_id=resolved.self_node_id,
+                last_window_id=max(len(epoch_history) - 1, 0),
+                total_samples_processed=total_samples_processed,
+                final_state_digest=final_state_digest,
+                completed_at=utc_now_iso(),
+            ),
+            timeout_s=_completion_timeout_s(resolved, overrides),
+        )
+        if overrides.shutdown_grace_s > 0:
+            # Keep server alive so late-arriving followers can report completion.
+            time.sleep(overrides.shutdown_grace_s)
+        summary = {
+            "run_id": run_id,
+            "cluster_name": resolved.cluster.cluster_name,
+            "self_node_id": resolved.self_node_id,
+            "device": str(device),
+            "dataset": config.dataset.name,
+            "model": config.model.name,
+            "mode": config.mode,
+            "algorithm": config.algorithm,
+            "history_kind": "epochs",
+            "started_at": started_at,
+            "finished_at": utc_now_iso(),
+            "run_duration_s": run_duration_s,
+            "cluster_node_count": len(resolved.cluster.nodes),
+            "epoch_count": len(epoch_history),
+            "local_train_sample_count": epoch_history[-1]["samples_processed"] if epoch_history else 0,
+            "total_samples_processed": total_samples_processed,
+            "effective_samples_per_s": safe_rate(total_samples_processed, run_duration_s),
+            "best_val_accuracy": best_val_accuracy,
+            "best_test_accuracy": max((row["test_accuracy"] for row in epoch_history), default=None),
+            "best_val_macro_f1": best_val_macro_f1,
+            "best_test_macro_f1": max((row["test_macro_f1"] for row in epoch_history), default=None),
+            "metrics_file": f"async_epoch_metrics.{metrics_ext}",
+            "scheduler_history_file": (
+                str(scheduler_history_path) if scheduler_history_path is not None else None
+            ),
+            "transport_address": server.address,
+            "advertise_address": _node_target(resolved.self_node.host, resolved.self_node.port),
+            "neighbor_ids": [neighbor.id for neighbor in neighbors],
+            "mixed_peer_updates_total": mixed_peer_updates_total,
+            "dropped_peer_updates_total": dropped_peer_updates_total,
+            "nonfinite_peer_updates_total": nonfinite_peer_updates_total,
+            "max_observed_staleness": max_observed_staleness,
+            "max_observed_normalized_staleness": max_observed_normalized_staleness,
+            "stale_mixed_peer_updates_total": stale_mixed_peer_updates_total,
+            "hard_dropped_stale_peer_updates_total": hard_dropped_stale_peer_updates_total,
+            "failed_pushes_total": failed_pushes_total,
+            "push_count_total": push_count_total,
+            "push_elapsed_s_total": push_elapsed_s_total,
+            "push_failed_targets_total": sorted(push_failed_targets_total),
+            "push_failure_reasons_total": push_failure_reasons_total,
+            "max_local_step": local_step,
+            "epochs": epoch_history,
+            "received_payload_count": server.snapshot().to_dict()["received_payload_count"],
+            "final_test_metrics": final_test_metrics,
+            "final_state_digest": final_state_digest,
+            "data_plane_stats": data_plane_stats,
+            "control_plane_role": (
+                "bootstrap"
+                if (resolved.cluster.bootstrap_node_id or resolved.self_node_id)
+                == resolved.self_node_id
+                else "follower"
+            ),
+            "completion_reported": completion_status["reported"],
+            "completion_cluster_complete": completion_status["cluster_complete"],
+            "completion_seen_count": completion_status["seen_count"],
+            "missing_completion_nodes": completion_status["missing_node_ids"],
+        }
+        write_summary(log_dir / "async_run_summary.json", summary)
+        return summary
+    finally:
+        # If training was interrupted before write_summary() ran (crash / OOM / SIGKILL),
+        # write a partial summary so the run is not completely invisible to collect.
+        summary_path = log_dir / "async_run_summary.json"
+        if epoch_history and not summary_path.exists():
+            try:
+                _dur = time.perf_counter() - run_started_perf
+                _total = sum(r["samples_processed"] for r in epoch_history)
+                _partial = {
+                    "run_id": run_id,
+                    "self_node_id": resolved.self_node_id,
+                    "status": "partial",
+                    "epoch_count": len(epoch_history),
+                    "started_at": started_at,
+                    "finished_at": utc_now_iso(),
+                    "run_duration_s": _dur,
+                    "total_samples_processed": _total,
+                    "best_test_accuracy": max(
+                        (r["test_accuracy"] for r in epoch_history if r.get("test_accuracy")),
+                        default=None,
+                    ),
+                    "best_val_accuracy": max(
+                        (r["val_accuracy"] for r in epoch_history if r.get("val_accuracy")),
+                        default=None,
+                    ),
+                    "mixed_peer_updates_total": mixed_peer_updates_total,
+                    "push_count_total": push_count_total,
+                    "failed_pushes_total": failed_pushes_total,
+                    "epochs": epoch_history,
+                }
+                write_summary(summary_path, _partial)
+            except Exception:
+                pass  # never suppress the original exception
+        if adaptive_runtime is not None:
+            adaptive_runtime.close()
+        server.stop(grace=0.0)
+        if config_http_server is not None:
+            config_http_server.stop()
+
+
+def run_async_smoke(
+    peer_count: int = 3,
+    rounds: int = 2,
+    *,
+    storage_mode: str = "replicated",
+    scheduler_mode: str = "static",
+    rebalance_window_batches: int | None = None,
+    fake_train_size: int | None = None,
+) -> dict:
+    if peer_count < 2:
+        raise ValueError("peer_count must be at least 2")
+
+    ctx = mp.get_context("spawn")
+    results_queue = ctx.Queue()
+    processes = []
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        cluster_path, training_paths, node_ids = _write_async_smoke_configs(
+            tmp_path=tmp_path,
+            peer_count=peer_count,
+            storage_mode=storage_mode,
+            scheduler_mode=scheduler_mode,
+            rebalance_window_batches=rebalance_window_batches,
+            fake_train_size=fake_train_size,
+        )
+
+        try:
+            for node_id in node_ids:
+                round_delay_s = 0.8 if node_id == node_ids[-1] else 0.0
+                process = ctx.Process(
+                    target=_async_worker_process,
+                    args=(
+                        cluster_path,
+                        training_paths[node_id],
+                        node_id,
+                        results_queue,
+                        AsyncRunOverrides(
+                            rounds=rounds,
+                            max_local_batches=2,
+                            max_eval_batches=1,
+                            run_name="async-smoke",
+                            transport_timeout_s=20.0,
+                            bind_host="127.0.0.1",
+                            round_delay_s=round_delay_s,
+                            shutdown_grace_s=2.5,
+                        ),
+                    ),
+                )
+                process.start()
+                processes.append(process)
+
+            results = {}
+            for _ in node_ids:
+                item = results_queue.get(timeout=90.0)
+                results[item["self_node_id"]] = item
+
+            exit_codes = []
+            for process in processes:
+                process.join(timeout=30.0)
+                exit_codes.append(process.exitcode)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5.0)
+
+            return {
+                "peer_count": peer_count,
+                "configured_epochs": rounds,
+                "node_results": results,
+                "exit_codes": exit_codes,
+            }
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5.0)
+
+
+def _async_worker_process(
+    cluster_path: Path,
+    training_path: Path,
+    self_node_id: str,
+    results_queue: mp.Queue,
+    overrides: AsyncRunOverrides,
+) -> None:
+    try:
+        resolved = load_resolved_config(cluster_path, training_path, self_node_id)
+        result = run_async_worker(resolved, overrides=overrides)
+    except Exception:
+        result = {
+            "self_node_id": self_node_id,
+            "error": traceback.format_exc(),
+        }
+    results_queue.put(result)
+
+
+def _mix_with_latest_peer_payloads(
+    *,
+    current_state: dict[str, torch.Tensor],
+    current_version: int,
+    local_sample_count: int,
+    server: PeerServer,
+    neighbor_ids: list[str],
+    base_alpha: float,
+    max_staleness: int,
+    push_interval_steps: int,
+    local_relative_speed: float = 1.0,
+    peer_relative_speeds: dict[str, float] | None = None,
+    last_mixed_payload_ids: dict[str, str] | None = None,
+    delta_state: "DeltaExchangeState | None" = None,
+) -> dict:
+    require_state_finite(current_state, context=f"current async state at version={current_version}")
+    merged_state = {name: tensor.clone() for name, tensor in current_state.items()}
+    snapshot = server.snapshot()
+    eligible = []
+    dropped_peer_updates = 0
+    nonfinite_peer_updates = 0
+    hard_dropped_stale_peer_updates = 0
+    dropped_peer_senders: set[str] = set()
+    drop_reasons: list[str] = []
+    peer_relative_speeds = peer_relative_speeds or {}
+    local_relative_speed = max(float(local_relative_speed), 1e-9)
+    staleness_scale = float(max(max_staleness, push_interval_steps, 1))
+    hard_staleness_limit = staleness_scale * 20.0
+
+    def drop_payload(sender_id: str, payload_id: str, reason: str) -> None:
+        nonlocal dropped_peer_updates
+        dropped_peer_updates += 1
+        dropped_peer_senders.add(sender_id)
+        drop_reasons.append(f"{sender_id}:{reason}")
+        if last_mixed_payload_ids is not None:
+            last_mixed_payload_ids[sender_id] = payload_id
+
+    for summary in snapshot.payloads:
+        if summary.sender_node_id not in neighbor_ids:
+            continue
+        if summary.payload_kind not in _KNOWN_ASYNC_PAYLOAD_KINDS:
+            continue
+        if (
+            last_mixed_payload_ids is not None
+            and last_mixed_payload_ids.get(summary.sender_node_id) == summary.payload_id
+        ):
+            continue
+        raw_version_gap = abs(current_version - summary.model_version)
+        peer_relative_speed = max(
+            float(peer_relative_speeds.get(summary.sender_node_id, local_relative_speed)),
+            1e-9,
+        )
+        expected_peer_version = current_version * (peer_relative_speed / local_relative_speed)
+        normalized_version_gap = abs(summary.model_version - expected_peer_version)
+        if normalized_version_gap > hard_staleness_limit:
+            hard_dropped_stale_peer_updates += 1
+            drop_payload(
+                summary.sender_node_id,
+                summary.payload_id,
+                "normalized_version_gap:"
+                f"{normalized_version_gap:.3f}>hard_max:{hard_staleness_limit:.3f}:"
+                f"raw_gap={raw_version_gap}:"
+                f"expected_peer_version={expected_peer_version:.3f}",
+            )
+            continue
+        payload = server.get_payload(summary.sender_node_id, summary.payload_id)
+        if payload is None:
+            continue
+        peer_sample_count = max(payload.metadata.sample_count, 1)
+
+        # ── Decompress to float32 before any shape/finite checks ──────────────
+        decompressed = _decompress_payload(
+            payload.tensors, summary.payload_kind, current_state
+        )
+        if decompressed is None:
+            drop_payload(
+                summary.sender_node_id,
+                summary.payload_id,
+                f"decompress_failed:kind={summary.payload_kind}",
+            )
+            continue
+
+        # ── Delta payloads: reconstruct full weights from the stored base ─────
+        if summary.payload_kind == "async_delta":
+            base = None if delta_state is None else delta_state.reconstructions.get(
+                summary.sender_node_id
+            )
+            if base is None:
+                drop_payload(
+                    summary.sender_node_id,
+                    summary.payload_id,
+                    "delta_no_base:no_reconstruction_available",
+                )
+                continue
+            try:
+                decompressed = {
+                    name: base[name].clone() + decompressed[name]
+                    for name in current_state
+                }
+            except (KeyError, RuntimeError) as exc:
+                drop_payload(
+                    summary.sender_node_id,
+                    summary.payload_id,
+                    f"delta_reconstruct_failed:{type(exc).__name__}",
+                )
+                continue
+            delta_state.reconstructions[summary.sender_node_id] = {
+                name: tensor.clone() for name, tensor in decompressed.items()
+            }
+        elif delta_state is not None and summary.payload_kind in (
+            "async_weights", "async_weights_f16", "async_weights_q8"
+        ):
+            # Full-weights payload: refresh the reconstruction base for this sender.
+            delta_state.reconstructions[summary.sender_node_id] = {
+                name: tensor.clone() for name, tensor in decompressed.items()
+            }
+
+        # ── Shape check (dtype is always float32 after decompression) ─────────
+        peer_keys = set(decompressed)
+        local_keys = set(current_state)
+        if peer_keys != local_keys:
+            missing = sorted(local_keys - peer_keys)
+            extra = sorted(peer_keys - local_keys)
+            drop_payload(
+                summary.sender_node_id,
+                summary.payload_id,
+                f"state_keys_mismatch:missing={missing[:4]}:extra={extra[:4]}",
+            )
+            continue
+        incompatible_shape = next(
+            (
+                name
+                for name in current_state
+                if current_state[name].shape != decompressed[name].shape
+            ),
+            None,
+        )
+        if incompatible_shape is not None:
+            drop_payload(
+                summary.sender_node_id,
+                summary.payload_id,
+                "state_shape_mismatch:"
+                f"{incompatible_shape}:"
+                f"local={tuple(current_state[incompatible_shape].shape)}:"
+                f"peer={tuple(decompressed[incompatible_shape].shape)}",
+            )
+            continue
+        peer_report = check_state_finite(decompressed)
+        if not peer_report.ok:
+            nonfinite_peer_updates += 1
+            drop_payload(
+                summary.sender_node_id,
+                summary.payload_id,
+                f"nonfinite_payload:{peer_report.format_summary()}",
+            )
+            continue
+        eligible.append(
+            (
+                summary.sender_node_id,
+                summary.payload_id,
+                raw_version_gap,
+                normalized_version_gap,
+                peer_sample_count,
+                decompressed,
+            )
+        )
+
+    eligible.sort(key=lambda item: item[0])
+    mixed_senders = []
+    observed_version_gap = 0
+    observed_normalized_version_gap = 0.0
+    stale_mixed_peer_updates = 0
+    for sender_id, payload_id, raw_version_gap, normalized_version_gap, peer_sample_count, peer_tensors in eligible:
+        peer_sample_count = max(peer_sample_count, 1)
+        local_weight = max(local_sample_count, 1)
+        peer_ratio = peer_sample_count / float(local_weight + peer_sample_count)
+        alpha = min(
+            1.0,
+            max(0.0, base_alpha * peer_ratio / (1.0 + normalized_version_gap / staleness_scale)),
+        )
+        proposed_state = {name: tensor.clone() for name, tensor in merged_state.items()}
+        for name in proposed_state:
+            if torch.is_floating_point(proposed_state[name]):
+                proposed_state[name] = (
+                    proposed_state[name] * (1.0 - alpha) + peer_tensors[name] * alpha
+                )
+        merged_report = check_state_finite(proposed_state)
+        if not merged_report.ok:
+            nonfinite_peer_updates += 1
+            drop_payload(
+                sender_id,
+                payload_id,
+                f"nonfinite_merged_state:{merged_report.format_summary()}",
+            )
+            continue
+        merged_state = proposed_state
+        mixed_senders.append(sender_id)
+        observed_version_gap = max(observed_version_gap, raw_version_gap)
+        observed_normalized_version_gap = max(
+            observed_normalized_version_gap,
+            normalized_version_gap,
+        )
+        if raw_version_gap > max_staleness:
+            stale_mixed_peer_updates += 1
+        if last_mixed_payload_ids is not None:
+            last_mixed_payload_ids[sender_id] = payload_id
+
+    return {
+        "state": merged_state,
+        "mixed_peer_updates": len(mixed_senders),
+        "mixed_senders": mixed_senders,
+        "max_staleness": observed_version_gap,
+        "max_normalized_staleness": observed_normalized_version_gap,
+        "stale_mixed_peer_updates": stale_mixed_peer_updates,
+        "hard_dropped_stale_peer_updates": hard_dropped_stale_peer_updates,
+        "dropped_peer_updates": dropped_peer_updates,
+        "dropped_peer_senders": sorted(dropped_peer_senders),
+        "drop_reasons": drop_reasons,
+        "nonfinite_peer_updates": nonfinite_peer_updates,
+    }
+
+
+_KNOWN_ASYNC_PAYLOAD_KINDS = frozenset({
+    "async_weights",
+    "async_delta",
+    "async_weights_f16",
+    "async_weights_q8",
+})
+
+
+def _compress_state(
+    state: dict[str, torch.Tensor],
+    compression: str,
+    topk_fraction: float,
+) -> tuple[dict[str, torch.Tensor], str]:
+    """Compress model state for transmission. Returns (compressed_tensors, payload_kind).
+
+    The returned tensors are new objects; ``state`` is never mutated.
+    Backward compat: compression="none" is a no-op and returns the original dict.
+    """
+    if compression == "none":
+        return state, "async_weights"
+
+    if compression == "float16":
+        return (
+            {k: v.half() if torch.is_floating_point(v) else v for k, v in state.items()},
+            "async_weights_f16",
+        )
+
+    if compression == "quant8":
+        compressed: dict[str, torch.Tensor] = {}
+        for name, tensor in state.items():
+            if not torch.is_floating_point(tensor):
+                compressed[name] = tensor
+                continue
+            t = tensor.float().reshape(-1)
+            t_min = t.min()
+            t_max = t.max()
+            scale = (t_max - t_min).clamp(min=1e-8)
+            q = ((t - t_min) / scale * 255.0).clamp(0, 255).to(torch.uint8)
+            compressed[name] = q.reshape(tensor.shape)
+            # Store scale metadata as a 2-element float32 tensor. The double-
+            # underscore prefix cannot collide with real parameter names.
+            compressed[f"__q8s__{name}"] = torch.tensor(
+                [t_min.item(), scale.item()], dtype=torch.float32
+            )
+        return compressed, "async_weights_q8"
+
+    if compression == "topk_sparse":
+        compressed = {}
+        for name, tensor in state.items():
+            if not torch.is_floating_point(tensor):
+                compressed[name] = tensor
+                continue
+            flat = tensor.float().reshape(-1)
+            k = max(1, int(flat.numel() * topk_fraction))
+            topk_indices = flat.abs().topk(k, largest=True, sorted=False).indices
+            mask = torch.zeros_like(flat, dtype=torch.bool)
+            mask[topk_indices] = True
+            sparse_flat = torch.where(mask, flat, torch.zeros_like(flat))
+            # Cast to float16 to halve wire size; _decompress_payload casts back.
+            compressed[name] = sparse_flat.reshape(tensor.shape).half()
+        return compressed, "async_weights"  # zeros compress at transport level
+
+    raise ValueError(f"Unknown compression: {compression!r}")
+
+
+def _decompress_payload(
+    tensors: dict[str, torch.Tensor],
+    payload_kind: str,
+    reference: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor] | None:
+    """Decompress received payload tensors back to float32 model-compatible state dict.
+
+    Returns None on any unrecoverable error so the caller can drop the payload.
+    ``reference`` is current_state and is only used for key/shape context.
+    """
+    try:
+        if payload_kind in ("async_weights", "async_delta"):
+            # topk_sparse arrives as float16 under "async_weights"; cast all floats.
+            return {
+                k: v.float() if v.dtype == torch.float16 else v
+                for k, v in tensors.items()
+                if not k.startswith("__q8s__")
+            }
+
+        if payload_kind == "async_weights_f16":
+            return {
+                k: v.float() if torch.is_floating_point(v) else v
+                for k, v in tensors.items()
+                if not k.startswith("__q8s__")
+            }
+
+        if payload_kind == "async_weights_q8":
+            result: dict[str, torch.Tensor] = {}
+            for name in reference:
+                if name not in tensors:
+                    return None  # missing tensor — corrupt payload
+                if not torch.is_floating_point(reference[name]):
+                    result[name] = tensors[name]
+                    continue
+                scale_key = f"__q8s__{name}"
+                if scale_key not in tensors:
+                    return None  # missing scale metadata
+                meta = tensors[scale_key].float()
+                t_min, scale = meta[0].item(), meta[1].item()
+                q = tensors[name].float()
+                result[name] = (q / 255.0 * scale + t_min).reshape(reference[name].shape)
+            return result
+
+    except Exception:
+        return None
+
+    return None  # unknown kind
+
+
+def _push_payload_best_effort(
+    *,
+    target: str,
+    sender_node_id: str,
+    payload: PeerPayload,
+    timeout_s: float,
+) -> PushAttemptResult:
+    started = time.perf_counter()
+    timeout_s = max(_MIN_RPC_TIMEOUT_S, timeout_s)
+
+    client = PeerClient(target)
+    try:
+        client.ping(
+            sender_node_id=sender_node_id,
+            timeout_s=min(_PUSH_PREFLIGHT_TIMEOUT_S, timeout_s),
+        )
+    except Exception as exc:
+        return PushAttemptResult(
+            ok=False,
+            target=target,
+            elapsed_s=time.perf_counter() - started,
+            error_type="preflight_ping_failed",
+            error_message=_exception_summary(exc),
+        )
+    finally:
+        client.close()
+
+    remaining_s = timeout_s - (time.perf_counter() - started)
+    if remaining_s < _MIN_RPC_TIMEOUT_S:
+        return PushAttemptResult(
+            ok=False,
+            target=target,
+            elapsed_s=time.perf_counter() - started,
+            error_type="preflight_exhausted_timeout",
+            error_message=f"timeout_s={timeout_s:.3f}",
+        )
+
+    client = PeerClient(target)
+    try:
+        result = client.push_payload(payload, timeout_s=max(_MIN_RPC_TIMEOUT_S, remaining_s))
+        return PushAttemptResult(
+            ok=True,
+            target=target,
+            elapsed_s=time.perf_counter() - started,
+            num_bytes=result.num_bytes,
+        )
+    except Exception as exc:
+        return PushAttemptResult(
+            ok=False,
+            target=target,
+            elapsed_s=time.perf_counter() - started,
+            error_type="push_payload_failed",
+            error_message=_exception_summary(exc),
+        )
+    finally:
+        client.close()
+
+
+def _exception_summary(exc: Exception, *, max_len: int = 240) -> str:
+    if isinstance(exc, grpc.RpcError):
+        code = exc.code().name if exc.code() is not None else "UNKNOWN"
+        details = exc.details() or ""
+        summary = f"{type(exc).__name__}:{code}:{details}"
+    else:
+        summary = f"{type(exc).__name__}:{exc}"
+    return summary[:max_len]
+
+
+def _write_async_smoke_configs(
+    tmp_path: Path,
+    peer_count: int,
+    *,
+    storage_mode: str = "replicated",
+    scheduler_mode: str = "static",
+    rebalance_window_batches: int | None = None,
+    fake_train_size: int | None = None,
+) -> tuple[Path, dict[str, Path], list[str]]:
+    node_ids = [f"node-{idx + 1}" for idx in range(peer_count)]
+    ports = [_find_free_port() for _ in range(peer_count)]
+    cluster_payload = {
+        "cluster_name": "async-smoke",
+        "transport": "grpc",
+        "overlay_network": "none",
+        "tls_enabled": False,
+        "bootstrap_node_id": node_ids[0],
+        "nodes": [],
+    }
+    for idx, node_id in enumerate(node_ids):
+        neighbors = [neighbor_id for neighbor_id in node_ids if neighbor_id != node_id]
+        cluster_payload["nodes"].append(
+            {
+                "id": node_id,
+                "host": "127.0.0.1",
+                "port": ports[idx],
+                "platform": "linux",
+                "neighbors": neighbors,
+                "weight": 1.0,
+                "resources": {
+                    "cpu_cores": 2,
+                    "accelerator": "cpu",
+                    "relative_speed": 1.0,
+                },
+            }
+        )
+
+    training_payload = load_yaml(PROJECT_ROOT / "configs" / "training.local-smoke.yaml")
+    training_payload["device_preference"] = ["cpu"]
+    training_payload["mode"] = "async"
+    training_payload["async"]["enabled"] = True
+    training_payload["async"]["push_interval_steps"] = 1
+    training_payload["async"]["max_staleness"] = 2
+    training_payload["async"]["mixing_alpha"] = 0.7
+    training_payload["sync"]["enabled"] = False
+    training_payload["dataset"]["partitioning"] = "homogeneous"
+    training_payload["dataset"]["scheduler_mode"] = scheduler_mode
+    training_payload["dataset"]["rebalance_window_batches"] = (
+        rebalance_window_batches if rebalance_window_batches is not None else 2
+    )
+    training_payload["dataset"]["throughput_ema"] = 0.0
+    training_payload["dataset"]["warmup_windows"] = 1
+    training_payload["dataset"]["min_local_shards"] = 1
+    if fake_train_size is not None:
+        training_payload["dataset"]["fake_train_size"] = fake_train_size
+    training_payload["logging"]["log_dir"] = str(tmp_path / "logs")
+    training_payload["logging"]["checkpoint_dir"] = str(tmp_path / "checkpoints")
+    training_payload["optimization"]["eval_every_epochs"] = 1
+
+    cluster_path = tmp_path / "cluster.async-smoke.yaml"
+    with cluster_path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(cluster_payload, handle, sort_keys=False)
+
+    training_paths: dict[str, Path] = {}
+    if storage_mode == "replicated":
+        training_path = tmp_path / "training.async-smoke.yaml"
+        with training_path.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(training_payload, handle, sort_keys=False)
+        for node_id in node_ids:
+            training_paths[node_id] = training_path
+        return cluster_path, training_paths, node_ids
+
+    if storage_mode != "micro_shards":
+        raise ValueError(f"Unsupported storage_mode for async smoke: {storage_mode}")
+
+    training_payload["dataset"]["storage_mode"] = "micro_shards"
+    training_payload["dataset"]["shard_samples"] = 4
+    bootstrap_manifest_path = tmp_path / node_ids[0] / "manifest.json"
+    training_payload["dataset"]["manifest_path"] = str(bootstrap_manifest_path)
+    training_payload["dataset"]["cache_dir"] = str(bootstrap_manifest_path.parent)
+    bootstrap_training_path = tmp_path / node_ids[0] / "training.async-smoke.micro.yaml"
+    bootstrap_training_path.parent.mkdir(parents=True, exist_ok=True)
+    with bootstrap_training_path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(training_payload, handle, sort_keys=False)
+    build_dataset_shards(load_resolved_config(cluster_path, bootstrap_training_path, node_ids[0]).training)
+    manifest = load_manifest(bootstrap_manifest_path)
+
+    for node_id in node_ids:
+        node_dir = tmp_path / node_id
+        node_dir.mkdir(parents=True, exist_ok=True)
+        node_training_payload = load_yaml(bootstrap_training_path)
+        node_training_payload["dataset"]["manifest_path"] = str(node_dir / "manifest.json")
+        node_training_payload["dataset"]["cache_dir"] = str(
+            node_dir if node_id == node_ids[0] else node_dir / "cache"
+        )
+        node_training_payload["logging"]["log_dir"] = str(tmp_path / "logs")
+        node_training_payload["logging"]["checkpoint_dir"] = str(tmp_path / "checkpoints")
+        node_training_path = node_dir / "training.async-smoke.micro.yaml"
+        with node_training_path.open("w", encoding="utf-8") as handle:
+            yaml.safe_dump(node_training_payload, handle, sort_keys=False)
+        if node_id == node_ids[0]:
+            save_manifest(manifest, node_dir / "manifest.json")
+        training_paths[node_id] = node_training_path
+
+    return cluster_path, training_paths, node_ids
+
+
+def _wait_for_neighbors(self_node_id: str, neighbors: list, timeout_s: float) -> None:
+    deadline = time.time() + timeout_s
+    pending = {neighbor.id: _node_target(neighbor.host, neighbor.port) for neighbor in neighbors}
+    while pending:
+        if time.time() > deadline:
+            missing = ", ".join(sorted(pending))
+            raise TimeoutError(f"Node '{self_node_id}' timed out waiting for neighbors: {missing}")
+
+        for neighbor_id in list(pending):
+            client = PeerClient(pending[neighbor_id])
+            try:
+                client.ping(sender_node_id=self_node_id, timeout_s=1.0)
+            except Exception:
+                time.sleep(0.1)
+            else:
+                pending.pop(neighbor_id)
+            finally:
+                client.close()
+
+
+def _tensor_finite_status(tensor: torch.Tensor) -> str:
+    tensor_cpu = tensor.detach().to("cpu")
+    finite_mask = torch.isfinite(tensor_cpu)
+    finite_count = int(finite_mask.sum().item())
+    total_count = tensor_cpu.numel()
+    if finite_count == 0:
+        return f"finite={finite_count}/{total_count}, min=None, max=None"
+    finite_values = tensor_cpu[finite_mask]
+    return (
+        f"finite={finite_count}/{total_count}, "
+        f"min={float(finite_values.min().item())}, "
+        f"max={float(finite_values.max().item())}"
+    )
+
+
+def _gradient_finite_status(model: nn.Module) -> tuple[bool, str]:
+    bad_names: list[str] = []
+    max_abs_grad = 0.0
+    checked_count = 0
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        checked_count += 1
+        grad_cpu = parameter.grad.detach().to("cpu")
+        if not bool(torch.isfinite(grad_cpu).all().item()):
+            bad_names.append(name)
+            continue
+        if grad_cpu.numel() > 0:
+            max_abs_grad = max(max_abs_grad, float(grad_cpu.abs().max().item()))
+
+    shown_names = ", ".join(bad_names[:8])
+    if len(bad_names) > 8:
+        shown_names = f"{shown_names}, ..."
+    return (
+        not bad_names,
+        f"checked={checked_count}, bad_count={len(bad_names)}, "
+        f"bad_parameters=[{shown_names}], max_abs_finite_grad={max_abs_grad}",
+    )
+
+
+def _train_async_window(
+    model: nn.Module,
+    loader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+    *,
+    num_classes: int,
+    max_batches: int | None,
+    start_step: int,
+    run_id: str,
+    self_node_id: str,
+    server: PeerServer,
+    neighbors: list,
+    push_fanout: int,
+    push_interval_steps: int,
+    base_alpha: float,
+    max_staleness: int,
+    local_relative_speed: float,
+    peer_relative_speeds: dict[str, float],
+    gradient_clip_norm: float | None,
+    transport_timeout_s: float,
+    last_mixed_payload_ids: dict[str, str],
+    communication_policy: str = "full",
+    score_tracker: PeerScoreTracker | None = None,
+    delta_state: "DeltaExchangeState | None" = None,
+    compression: str = "none",
+    topk_fraction: float = 0.1,
+    all_neighbor_ids: list[str] | None = None,
+) -> dict[str, float | int | list[str]]:
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    processed_batches = 0
+    confusion = init_confusion_matrix(num_classes)
+    current_step = start_step
+    samples_since_push = 0
+    pushes_sent = 0
+    failed_pushes = 0
+    push_elapsed_s = 0.0
+    push_failed_targets: set[str] = set()
+    push_failure_reasons: list[str] = []
+    mixed_peer_updates = 0
+    max_observed_staleness = 0
+    max_observed_normalized_staleness = 0.0
+    stale_mixed_peer_updates = 0
+    hard_dropped_stale_peer_updates = 0
+    mixed_senders_seen: set[str] = set()
+    dropped_peer_updates = 0
+    nonfinite_peer_updates = 0
+    dropped_peer_senders_seen: set[str] = set()
+    drop_reasons: list[str] = []
+
+    for inputs, targets in loader:
+        targets_cpu = targets.detach().to("cpu", dtype=torch.int64).reshape(-1)
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(inputs)
+        if not bool(torch.isfinite(logits).all().item()):
+            raise FloatingPointError(
+                "Non-finite logits during async training: "
+                f"node_id={self_node_id}, step={current_step + 1}, "
+                f"batch_index={processed_batches}, {_tensor_finite_status(logits)}"
+            )
+        loss = criterion(logits, targets)
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError(
+                "Non-finite loss during async training: "
+                f"node_id={self_node_id}, step={current_step + 1}, "
+                f"batch_index={processed_batches}, loss={float(loss.detach().to('cpu').item())}, "
+                f"logits={_tensor_finite_status(logits)}"
+            )
+        loss.backward()
+        if gradient_clip_norm is not None:
+            gradients_ok, gradients_summary = _gradient_finite_status(model)
+            if not gradients_ok:
+                raise FloatingPointError(
+                    "Non-finite gradients during async training: "
+                    f"node_id={self_node_id}, step={current_step + 1}, "
+                    f"batch_index={processed_batches}, {gradients_summary}"
+                )
+            try:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=gradient_clip_norm,
+                    error_if_nonfinite=True,
+                )
+            except RuntimeError as exc:
+                raise FloatingPointError(
+                    "Non-finite gradients during async training: "
+                    f"node_id={self_node_id}, step={current_step + 1}, "
+                    f"batch_index={processed_batches}, clip_norm={gradient_clip_norm}, "
+                    f"{_gradient_finite_status(model)[1]}"
+                ) from exc
+        optimizer.step()
+
+        batch_size = targets_cpu.numel()
+        total_loss += loss.item() * batch_size
+        preds_cpu = logits.argmax(dim=1).detach().to("cpu", dtype=torch.int64).reshape(-1)
+        correct += (preds_cpu == targets_cpu).sum().item()
+        total += batch_size
+        update_confusion_matrix(confusion, logits, targets_cpu)
+        processed_batches += 1
+        current_step += 1
+        samples_since_push += batch_size
+
+        if current_step % push_interval_steps == 0:
+            exchange_result = _exchange_async_update(
+                model=model,
+                device=device,
+                optimizer=optimizer,
+                current_step=current_step,
+                sample_count=samples_since_push,
+                run_id=run_id,
+                self_node_id=self_node_id,
+                server=server,
+                neighbors=neighbors,
+                push_fanout=push_fanout,
+                push_interval_steps=push_interval_steps,
+                base_alpha=base_alpha,
+                max_staleness=max_staleness,
+                local_relative_speed=local_relative_speed,
+                peer_relative_speeds=peer_relative_speeds,
+                transport_timeout_s=transport_timeout_s,
+                last_mixed_payload_ids=last_mixed_payload_ids,
+                communication_policy=communication_policy,
+                score_tracker=score_tracker,
+                delta_state=delta_state,
+                compression=compression,
+                topk_fraction=topk_fraction,
+                all_neighbor_ids=all_neighbor_ids,
+            )
+            pushes_sent += exchange_result["pushes_sent"]
+            failed_pushes += exchange_result["failed_pushes"]
+            push_elapsed_s += float(exchange_result["push_elapsed_s"])
+            push_failed_targets.update(exchange_result["push_failed_targets"])
+            push_failure_reasons.extend(exchange_result["push_failure_reasons"])
+            mixed_peer_updates += exchange_result["mixed_peer_updates"]
+            max_observed_staleness = max(
+                max_observed_staleness, exchange_result["max_staleness"]
+            )
+            max_observed_normalized_staleness = max(
+                max_observed_normalized_staleness,
+                float(exchange_result["max_normalized_staleness"]),
+            )
+            stale_mixed_peer_updates += exchange_result["stale_mixed_peer_updates"]
+            hard_dropped_stale_peer_updates += exchange_result[
+                "hard_dropped_stale_peer_updates"
+            ]
+            mixed_senders_seen.update(exchange_result["mixed_senders"])
+            dropped_peer_updates += exchange_result["dropped_peer_updates"]
+            nonfinite_peer_updates += exchange_result["nonfinite_peer_updates"]
+            dropped_peer_senders_seen.update(exchange_result["dropped_peer_senders"])
+            drop_reasons.extend(exchange_result["drop_reasons"])
+            samples_since_push = 0
+
+        if max_batches is not None and processed_batches >= max_batches:
+            break
+
+    if processed_batches > 0 and (samples_since_push > 0 or pushes_sent == 0):
+        exchange_result = _exchange_async_update(
+            model=model,
+            device=device,
+            optimizer=optimizer,
+            current_step=current_step,
+            sample_count=max(samples_since_push, 1),
+            run_id=run_id,
+            self_node_id=self_node_id,
+            server=server,
+            neighbors=neighbors,
+            push_fanout=push_fanout,
+            push_interval_steps=push_interval_steps,
+            base_alpha=base_alpha,
+            max_staleness=max_staleness,
+            local_relative_speed=local_relative_speed,
+            peer_relative_speeds=peer_relative_speeds,
+            transport_timeout_s=transport_timeout_s,
+            last_mixed_payload_ids=last_mixed_payload_ids,
+            communication_policy=communication_policy,
+            score_tracker=score_tracker,
+            delta_state=delta_state,
+            compression=compression,
+            topk_fraction=topk_fraction,
+            all_neighbor_ids=all_neighbor_ids,
+        )
+        pushes_sent += exchange_result["pushes_sent"]
+        failed_pushes += exchange_result["failed_pushes"]
+        push_elapsed_s += float(exchange_result["push_elapsed_s"])
+        push_failed_targets.update(exchange_result["push_failed_targets"])
+        push_failure_reasons.extend(exchange_result["push_failure_reasons"])
+        mixed_peer_updates += exchange_result["mixed_peer_updates"]
+        max_observed_staleness = max(max_observed_staleness, exchange_result["max_staleness"])
+        max_observed_normalized_staleness = max(
+            max_observed_normalized_staleness,
+            float(exchange_result["max_normalized_staleness"]),
+        )
+        stale_mixed_peer_updates += exchange_result["stale_mixed_peer_updates"]
+        hard_dropped_stale_peer_updates += exchange_result["hard_dropped_stale_peer_updates"]
+        mixed_senders_seen.update(exchange_result["mixed_senders"])
+        dropped_peer_updates += exchange_result["dropped_peer_updates"]
+        nonfinite_peer_updates += exchange_result["nonfinite_peer_updates"]
+        dropped_peer_senders_seen.update(exchange_result["dropped_peer_senders"])
+        drop_reasons.extend(exchange_result["drop_reasons"])
+
+    summary_metrics = summarize_classification_metrics(
+        total_loss=total_loss,
+        correct=correct,
+        total=total,
+        confusion=confusion,
+    )
+    return {
+        **summary_metrics,
+        "total_loss_raw": total_loss,
+        "correct_count": correct,
+        "confusion": confusion,
+        "mixed_peer_updates": mixed_peer_updates,
+        "mixed_senders": sorted(mixed_senders_seen),
+        "max_staleness": max_observed_staleness,
+        "max_normalized_staleness": max_observed_normalized_staleness,
+        "stale_mixed_peer_updates": stale_mixed_peer_updates,
+        "hard_dropped_stale_peer_updates": hard_dropped_stale_peer_updates,
+        "dropped_peer_updates": dropped_peer_updates,
+        "dropped_peer_senders": sorted(dropped_peer_senders_seen),
+        "drop_reasons": drop_reasons,
+        "nonfinite_peer_updates": nonfinite_peer_updates,
+        "pushes_sent": pushes_sent,
+        "failed_pushes": failed_pushes,
+        "push_elapsed_s": push_elapsed_s,
+        "push_failed_targets": sorted(push_failed_targets),
+        "push_failure_reasons": push_failure_reasons,
+        "last_step": current_step,
+    }
+
+
+def _init_train_accumulator(num_classes: int) -> dict[str, object]:
+    return {
+        "total_loss_raw": 0.0,
+        "correct_count": 0,
+        "samples_processed": 0,
+        "confusion": init_confusion_matrix(num_classes),
+    }
+
+
+def _accumulate_train_metrics(accumulator: dict[str, object], window_metrics: dict[str, object]) -> None:
+    accumulator["total_loss_raw"] = float(accumulator["total_loss_raw"]) + float(
+        window_metrics["total_loss_raw"]
+    )
+    accumulator["correct_count"] = int(accumulator["correct_count"]) + int(
+        window_metrics["correct_count"]
+    )
+    accumulator["samples_processed"] = int(accumulator["samples_processed"]) + int(
+        window_metrics["samples_processed"]
+    )
+    accumulator["confusion"] += window_metrics["confusion"]
+
+
+def _finalize_train_metrics(accumulator: dict[str, object]) -> dict[str, float]:
+    total_loss = float(accumulator["total_loss_raw"])
+    correct = int(accumulator["correct_count"])
+    total = int(accumulator["samples_processed"])
+    confusion = accumulator["confusion"]
+    return {
+        "loss": total_loss / max(total, 1),
+        "accuracy": correct / max(total, 1),
+        "macro_f1": macro_f1_from_confusion(confusion),
+        "samples_processed": total,
+    }
+
+
+def _exchange_async_update(
+    model: nn.Module,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    *,
+    current_step: int,
+    sample_count: int,
+    run_id: str,
+    self_node_id: str,
+    server: PeerServer,
+    neighbors: list,
+    push_fanout: int,
+    push_interval_steps: int,
+    base_alpha: float,
+    max_staleness: int,
+    transport_timeout_s: float,
+    last_mixed_payload_ids: dict[str, str],
+    local_relative_speed: float = 1.0,
+    peer_relative_speeds: dict[str, float] | None = None,
+    communication_policy: str = "full",
+    score_tracker: PeerScoreTracker | None = None,
+    delta_state: "DeltaExchangeState | None" = None,
+    compression: str = "none",
+    topk_fraction: float = 0.1,
+    all_neighbor_ids: list[str] | None = None,
+) -> dict:
+    current_state = extract_model_state(model)
+    require_state_finite(
+        current_state,
+        context=f"node_id={self_node_id}, step={current_step}, outgoing async state",
+    )
+
+    # ── Decide delta vs full weights ──────────────────────────────────────────
+    send_delta = delta_state is not None and delta_state.last_sent is not None
+    if send_delta:
+        payload_tensors = {
+            name: current_state[name].float() - delta_state.last_sent[name].float()
+            for name in current_state
+        }
+    else:
+        payload_tensors = current_state
+
+    # ── Apply compression (quant8 is skipped for deltas — the scale metadata
+    #    namespace conflicts with delta semantics) ──────────────────────────────
+    effective_compression = compression
+    if send_delta and compression == "quant8":
+        effective_compression = "none"
+    compressed_tensors, compressed_kind = _compress_state(
+        payload_tensors, effective_compression, topk_fraction
+    )
+    # Delta kind takes precedence so the receiver reconstructs before un-scaling.
+    effective_kind = "async_delta" if send_delta else compressed_kind
+
+    payload = PeerPayload(
+        metadata=PayloadMetadata(
+            sender_node_id=self_node_id,
+            payload_id=f"{run_id}:step:{current_step:05d}",
+            payload_kind=effective_kind,
+            model_version=current_step,
+            step=current_step,
+            sample_count=max(sample_count, 1),
+        ),
+        tensors=compressed_tensors,
+    )
+
+    pushes_sent = 0
+    failed_pushes = 0
+    push_elapsed_s = 0.0
+    push_failed_targets: set[str] = set()
+    push_failure_reasons: list[str] = []
+    # Dynamic graph controls the active set at the window level; per-step
+    # selection on the already-narrowed set uses ping_aware scoring.
+    effective_policy = "ping_aware" if communication_policy == "dynamic" else communication_policy
+    selected_neighbors = select_push_neighbors(
+        neighbors,
+        policy=effective_policy,
+        push_fanout=push_fanout,
+        current_step=current_step,
+        self_node_id=self_node_id,
+        tracker=score_tracker,
+    )
+    for neighbor in selected_neighbors:
+        push_result = _push_payload_best_effort(
+            target=_node_target(neighbor.host, neighbor.port),
+            sender_node_id=self_node_id,
+            payload=payload,
+            timeout_s=transport_timeout_s,
+        )
+        push_elapsed_s += push_result.elapsed_s
+        # Feed the outcome back into the peer-score tracker so communication
+        # policies adapt to who is fast/reliable. No-op effect for policy="full".
+        if score_tracker is not None:
+            score_tracker.record_push(
+                neighbor.id, ok=push_result.ok, latency_s=push_result.elapsed_s
+            )
+        if push_result.ok:
+            pushes_sent += 1
+        else:
+            failed_pushes += 1
+            push_failed_targets.add(neighbor.id)
+            push_failure_reasons.append(
+                f"{neighbor.id}@{push_result.target}:"
+                f"{push_result.error_type or 'unknown'}:"
+                f"{push_result.error_message or ''}"
+            )
+
+    # ── Update delta base after pushes ────────────────────────────────────────
+    if delta_state is not None:
+        if pushes_sent > 0:
+            # Receiver(s) now hold this state as their reconstruction base.
+            delta_state.last_sent = {name: t.clone() for name, t in current_state.items()}
+        elif failed_pushes > 0:
+            # All pushes failed — force a full-weights payload next time so the
+            # receiver can re-establish a base.
+            delta_state.last_sent = None
+
+    merge_result = _mix_with_latest_peer_payloads(
+        current_state=current_state,
+        current_version=current_step,
+        local_sample_count=max(sample_count, 1),
+        server=server,
+        neighbor_ids=all_neighbor_ids or [neighbor.id for neighbor in neighbors],
+        base_alpha=base_alpha,
+        max_staleness=max_staleness,
+        push_interval_steps=push_interval_steps,
+        local_relative_speed=local_relative_speed,
+        peer_relative_speeds=peer_relative_speeds,
+        last_mixed_payload_ids=last_mixed_payload_ids,
+        delta_state=delta_state,
+    )
+    if merge_result["mixed_peer_updates"] > 0:
+        require_state_finite(
+            merge_result["state"],
+            context=f"node_id={self_node_id}, step={current_step}, merged async state",
+        )
+        load_model_state(model, merge_result["state"], device)
+        optimizer.state.clear()
+    merge_result["pushes_sent"] = pushes_sent
+    merge_result["failed_pushes"] = failed_pushes
+    merge_result["push_elapsed_s"] = push_elapsed_s
+    merge_result["push_failed_targets"] = sorted(push_failed_targets)
+    merge_result["push_failure_reasons"] = push_failure_reasons
+    return merge_result
+
+
+@torch.no_grad()
+def _evaluate(
+    model: nn.Module,
+    loader,
+    criterion: nn.Module,
+    device: torch.device,
+    *,
+    num_classes: int,
+    max_batches: int | None,
+) -> dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    processed_batches = 0
+    confusion = init_confusion_matrix(num_classes)
+
+    for inputs, targets in loader:
+        targets_cpu = targets.detach().to("cpu", dtype=torch.int64).reshape(-1)
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        logits = model(inputs)
+        loss = criterion(logits, targets)
+
+        batch_size = targets_cpu.numel()
+        total_loss += loss.item() * batch_size
+        preds_cpu = logits.argmax(dim=1).detach().to("cpu", dtype=torch.int64).reshape(-1)
+        correct += (preds_cpu == targets_cpu).sum().item()
+        total += batch_size
+        update_confusion_matrix(confusion, logits, targets_cpu)
+        processed_batches += 1
+
+        if max_batches is not None and processed_batches >= max_batches:
+            break
+
+    metrics = summarize_classification_metrics(
+        total_loss=total_loss,
+        correct=correct,
+        total=total,
+        confusion=confusion,
+    )
+    metrics.pop("samples_processed", None)
+    return metrics
+
+
+def _node_target(host: str, port: int) -> str:
+    return f"{host}:{port}"
+
+
+# Peer selection now lives in algorithms/communication_policy.select_push_neighbors
+# (imported at module top). policy="full" reproduces the original rotation.
+
+
+def _completion_timeout_s(resolved: ResolvedConfig, overrides: AsyncRunOverrides) -> float:
+    # Cap at 5 minutes: dead nodes should not block survivors for hours.
+    # The original formula (transport_timeout_s * num_nodes) scaled to 3+ hours on a
+    # 20-node cluster and caused all surviving nodes to stall after any crash.
+    cluster_wait_floor = max(10.0, min(overrides.transport_timeout_s * 2, 300.0))
+    return max(cluster_wait_floor, overrides.shutdown_grace_s)
+
+
+def _coordinate_run_completion(
+    *,
+    resolved: ResolvedConfig,
+    server: PeerServer,
+    completion: RunCompletionRecord,
+    timeout_s: float,
+) -> dict[str, object]:
+    expected_node_ids = [node.id for node in resolved.cluster.nodes]
+    bootstrap_node_id = resolved.cluster.bootstrap_node_id or resolved.self_node_id
+    is_bootstrap = resolved.self_node_id == bootstrap_node_id
+
+    if is_bootstrap:
+        server.store_run_completion(completion)
+        cluster_complete = server.wait_for_run_completions(
+            node_ids=expected_node_ids,
+            timeout_s=timeout_s,
+        )
+        completions = server.get_run_completions()
+        seen_node_ids = {item.node_id for item in completions}
+        return {
+            "reported": True,
+            "cluster_complete": cluster_complete,
+            "seen_count": len(seen_node_ids),
+            "missing_node_ids": sorted(
+                node_id for node_id in expected_node_ids if node_id not in seen_node_ids
+            ),
+        }
+
+    reported = _report_run_completion_with_retry(
+        target=_node_target(
+            resolved.cluster.get_node(bootstrap_node_id).host,
+            resolved.cluster.get_node(bootstrap_node_id).port,
+        ),
+        completion=completion,
+        timeout_s=timeout_s,
+    )
+    return {
+        "reported": reported,
+        "cluster_complete": None,
+        "seen_count": 1 if reported else 0,
+        "missing_node_ids": [] if reported else [resolved.self_node_id],
+    }
+
+
+def _report_run_completion_with_retry(
+    *,
+    target: str,
+    completion: RunCompletionRecord,
+    timeout_s: float,
+) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        client = PeerClient(target)
+        try:
+            remaining_s = deadline - time.time()
+            if remaining_s <= 0:
+                break
+            client.report_run_completion(
+                completion,
+                timeout_s=min(_CONTROL_RPC_ATTEMPT_TIMEOUT_S, max(_MIN_RPC_TIMEOUT_S, remaining_s)),
+            )
+            return True
+        except Exception:
+            time.sleep(0.1)
+        finally:
+            client.close()
+    return False
+
+
+def _resolve_async_epoch_count(config, overrides: AsyncRunOverrides) -> int:
+    if overrides.epochs is not None:
+        return overrides.epochs
+    if overrides.rounds is not None:
+        return overrides.rounds
+    return config.optimization.epochs
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]

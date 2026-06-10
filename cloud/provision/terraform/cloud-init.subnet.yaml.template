@@ -1,0 +1,116 @@
+#cloud-config
+# cloud-init.subnet.yaml.template — bootstrap for the Terraform/private-subnet path.
+#
+# Differs from ../../cloud-init.yaml.template: NO Tailscale (nodes talk over the
+# private subnet) and NO ufw (the OpenStack security group filters ingress).
+#
+# Render with:
+#   python3 ../../render_cloud_init.py \
+#     --template cloud-init.subnet.yaml.template \
+#     --out cloud-init.rendered.yaml
+#
+# NOTE: in this mode TAILSCALE_AUTH_KEY in secrets.env is unused — it may be any
+# non-empty dummy value (the renderer still checks it's present).
+
+users:
+  - name: decentr
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - "{{ORCHESTRATOR_SSH_PUBKEY}}"
+
+# OpenStack sets the OS hostname from the instance name (decentr-NN).
+preserve_hostname: false
+
+package_update: true
+package_upgrade: false
+packages:
+  - git
+  - curl
+  - ca-certificates
+  - build-essential
+  - rsync
+  - python3.12
+  - python3.12-venv
+  - python3.12-dev
+  - python3-pip
+
+write_files:
+  - path: /home/decentr/.ssh/results_deploy_key
+    owner: decentr:decentr
+    permissions: '0600'
+    content: |
+{{RESULTS_DEPLOY_KEY_INDENTED}}
+
+  - path: /home/decentr/.ssh/project_deploy_key
+    owner: decentr:decentr
+    permissions: '0600'
+    content: |
+{{PROJECT_DEPLOY_KEY_INDENTED}}
+
+  - path: /home/decentr/.ssh/config
+    owner: decentr:decentr
+    permissions: '0600'
+    content: |
+      Host {{RESULTS_REPO_HOST}}
+        IdentityFile /home/decentr/.ssh/results_deploy_key
+        IdentitiesOnly yes
+        StrictHostKeyChecking accept-new
+      Host {{PROJECT_REPO_HOST}}
+        IdentityFile /home/decentr/.ssh/project_deploy_key
+        IdentitiesOnly yes
+        StrictHostKeyChecking accept-new
+
+  - path: /opt/decentr/.bootstrap.in_progress
+    content: "bootstrap started"
+    permissions: '0644'
+
+  - path: /opt/decentr/bootstrap.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      export HOME=/home/decentr
+      cd /opt/decentr
+
+      # Project clone: SSH key if provided (private repo), else HTTPS (public).
+      if [[ -s /home/decentr/.ssh/project_deploy_key ]]; then
+        GIT_SSH_COMMAND="ssh -i /home/decentr/.ssh/project_deploy_key -o StrictHostKeyChecking=accept-new" \
+          git clone --branch "{{PROJECT_REPO_BRANCH}}" "{{PROJECT_REPO_URL}}" DistLearn
+      else
+        HTTPS_URL=$(echo "{{PROJECT_REPO_URL}}" | sed -E 's#git@([^:]+):#https://\1/#')
+        git clone --branch "{{PROJECT_REPO_BRANCH}}" "$HTTPS_URL" DistLearn
+      fi
+
+      # Results repo clone (init locally if remote is empty).
+      GIT_SSH_COMMAND="ssh -i /home/decentr/.ssh/results_deploy_key -o StrictHostKeyChecking=accept-new" \
+        git clone "{{RESULTS_REPO_URL}}" decentr-results || {
+          mkdir -p decentr-results && cd decentr-results && git init && \
+          git remote add origin "{{RESULTS_REPO_URL}}" && cd ..
+        }
+      cd decentr-results
+      git config user.name "{{RESULTS_GIT_NAME}}"
+      git config user.email "{{RESULTS_GIT_EMAIL}}"
+      cd ..
+
+      # Python env + project install.
+      python3.12 -m venv venv
+      ./venv/bin/pip install --upgrade pip wheel
+      ./venv/bin/pip install -e ./DistLearn/Decentr_my_own
+
+      # Pre-download CIFAR10 so the first run doesn't race.
+      ./venv/bin/python -c "
+      from torchvision import datasets
+      datasets.CIFAR10('./DistLearn/Decentr_my_own/data', train=True, download=True)
+      datasets.CIFAR10('./DistLearn/Decentr_my_own/data', train=False, download=True)
+      "
+
+      mv /opt/decentr/.bootstrap.in_progress /opt/decentr/.bootstrap.done
+      echo "bootstrap finished at $(date -Is)" >> /opt/decentr/bootstrap.log
+
+runcmd:
+  - mkdir -p /opt/decentr
+  - chown -R decentr:decentr /opt/decentr /home/decentr/.ssh
+  - su - decentr -c "nohup bash /opt/decentr/bootstrap.sh > /opt/decentr/bootstrap.log 2>&1 &"
+
+final_message: "decentr subnet cloud-init done. bootstrap.sh running — poll /opt/decentr/.bootstrap.done."

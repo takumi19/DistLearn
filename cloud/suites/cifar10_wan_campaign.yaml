@@ -1,0 +1,412 @@
+suite_name: cifar10_wan_campaign
+description: "CIFAR-10/ResNet-18 decentralised gossip — WAN campaign"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fixed base in orchestrate.py DEFAULT_TRAINING (proven settings):
+#   seed42, 50 epochs, batch32, lr0.03, mom0.9, wd5e-4, grad_clip1.0,
+#   resnet18+groupnorm, micro_shards, heterogeneous, push_interval10,
+#   push_fanout0(all), mixing_alpha0.2, throughput_ema0.9, communication_policy=full.
+#
+# Ordered by COMPARISON VALUE for the study (change one factor vs the base):
+#   1. Baselines      — sync vs async vs async+adaptive (the foundation/reference)
+#   2. EMA sweep       — scheduler reactivity (ema_tput_0_1 already DONE = 52.7%)
+#   3. Peer policies   — Phase 2 CommunicationPolicy (the novel contribution)
+#   4. Topology        — how much graph connectivity is needed
+#   5. Comm frequency  — push_interval cost/quality tradeoff
+#   6. Fanout          — sparse gossip
+#   7. Bonus           — staleness, batch size (last)
+#
+# Disabled at the bottom still need Phase 3 code (delta/compression/dynamic_graph)
+# or a single-node driver. Phase 2 policy code is deployed (deploy_patches.sh, md5 60/60).
+# ─────────────────────────────────────────────────────────────────────────────
+
+experiments:
+
+  # ── Phase 0. Smoke (quick infra check after cluster rebuild) ──────────────────
+  - name: smoke
+    enabled: true
+    description: "2-epoch infra check on the base (full gossip)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        epochs: 2
+        dataset:
+          scheduler_mode: adaptive
+
+  # 2-epoch smoke for the Phase 3 code path (dynamic graph + modified mix/exchange).
+  # rebuild_windows=2 forces a graph rebuild within the smoke. Validates the new
+  # code on-cluster before the 50-epoch dynamic_graph run.
+  - name: smoke_dynamic
+    enabled: false   # validated 2026-06-08 (20/20, loss↓, mixed=53, no NaN)
+    description: "2-epoch Phase 3 smoke (dynamic graph rebuild + decompress path)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        epochs: 2
+        dataset:
+          scheduler_mode: adaptive
+        async:
+          communication_policy: dynamic
+          push_fanout: 4
+          dynamic_graph_rebuild_windows: 2
+          dynamic_graph_min_degree: 4
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # 1. BASELINES — the foundation. async_adaptive_default is the reference every
+  #    other experiment is compared against, so it runs first.
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  - name: async_adaptive_default
+    enabled: true
+    description: "Async gossip + adaptive workload scheduler (== fixed base, THE reference)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+
+  - name: async_static
+    enabled: true
+    description: "Async gossip, static scheduler — key comparison: does adaptive help?"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: static
+
+  - name: sync_static
+    enabled: true
+    description: "Synchronous AllReduce baseline — comparison: does async help?"
+    overlay: none
+    config:
+      training:
+        mode: sync
+        dataset:
+          scheduler_mode: static
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # 2. EMA SWEEP — scheduler reactivity. throughput_ema=0.9 == async_adaptive_default,
+  #    ema_tput_0_1 already DONE (52.7%). Complete the sweep with 0.5 and 0.99.
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  - name: ema_tput_0_1
+    enabled: true
+    description: "Adaptive, throughput_ema=0.1 (reacts fast) — DONE 2026-06-06 (52.7%)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+          throughput_ema: 0.1
+
+  - name: ema_tput_0_5
+    enabled: true
+    description: "Adaptive, throughput_ema=0.5 (compromise)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+          throughput_ema: 0.5
+
+  - name: ema_tput_0_99
+    enabled: true
+    description: "Adaptive, throughput_ema=0.99 (very slow adaptation)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+          throughput_ema: 0.99
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # 3. PEER-SELECTION POLICIES — Phase 2 (the novel contribution). Compared against
+  #    async_adaptive_default (full gossip) and random_fanout. Code deployed + 14/14
+  #    unit tests. push_fanout=4 bounds top-k targets per step.
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  - name: top_k_fastest
+    enabled: true
+    description: "Push only to fastest peers (score = capacity / (1+latency))"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset: {scheduler_mode: adaptive}
+        async: {communication_policy: top_k_fastest, push_fanout: 4}
+
+  - name: top_k_reliable
+    enabled: true
+    description: "Push only to most reliable peers (score = success_rate / (1+latency))"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset: {scheduler_mode: adaptive}
+        async: {communication_policy: top_k_reliable, push_fanout: 4}
+
+  - name: ping_aware
+    enabled: true
+    description: "Peer score = success_rate * capacity / (1 + ping_ms)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset: {scheduler_mode: adaptive}
+        async: {communication_policy: ping_aware, push_fanout: 4}
+
+  - name: reliability_aware_graph
+    enabled: false   # removed from queue 2026-06-09 (user, "пока") — re-enable to restore
+    description: "Prune static-graph edges with low success rate (min-degree floor)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset: {scheduler_mode: adaptive}
+        async: {communication_policy: reliability_aware}
+
+  - name: top_k_useful
+    enabled: true
+    description: "Prefer peers whose updates reduced loss (usefulness EMA; lower priority)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset: {scheduler_mode: adaptive}
+        async: {communication_policy: top_k_useful, push_fanout: 4}
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # 4. TOPOLOGY — how much connectivity is needed (vs full = async_adaptive_default).
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  - name: ring_topology
+    enabled: true
+    description: "Adaptive on a ring gossip graph (degree 2)"
+    overlay: none
+    topology: ring
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+
+  - name: sparse_expander
+    enabled: true
+    description: "Adaptive on a sparse circulant/expander graph (degree 4)"
+    overlay: none
+    topology: expander
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+
+  - name: star_topology
+    enabled: true
+    description: "Adaptive on a star gossip graph (hub = decentr-01)"
+    overlay: none
+    topology: star
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # 5. COMMUNICATION FREQUENCY — push_interval cost/quality (vs push=10 base).
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  - name: low_comm_100
+    enabled: true
+    description: "Adaptive, push every 100 steps (10x sparser than base)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+        async:
+          push_interval_steps: 100
+
+  - name: low_comm_300
+    enabled: true
+    description: "Adaptive, push every 300 steps (30x sparser than base)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+        async:
+          push_interval_steps: 300
+
+  - name: low_comm_500
+    enabled: true
+    description: "Adaptive, push every 500 steps (50x sparser than base)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+        async:
+          push_interval_steps: 500
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # 6. RANDOM FANOUT — sparse gossip (vs fanout=0 = all neighbours).
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  - name: random_fanout_1
+    enabled: true
+    description: "Adaptive, push to 1 rotating neighbour (fanout=1)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+        async:
+          push_fanout: 1
+
+  - name: random_fanout_2
+    enabled: true
+    description: "Adaptive, push to 2 rotating neighbours (fanout=2)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+        async:
+          push_fanout: 2
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # 7. BONUS — staleness + batch size (run last).
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  - name: staleness_2
+    enabled: true
+    description: "Adaptive, max_staleness=2 (fresh updates only)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+        async:
+          max_staleness: 2
+
+  - name: staleness_8
+    enabled: true
+    description: "Adaptive, max_staleness=8 (tolerate stale updates)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: adaptive
+        async:
+          max_staleness: 8
+
+  - name: batch_16
+    enabled: true
+    description: "Adaptive, batch_size=16 (more steps, more pushes)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        batch_size: 16
+        dataset:
+          scheduler_mode: adaptive
+
+  - name: batch_128
+    enabled: true
+    description: "Adaptive, batch_size=128 (fewer steps, fewer pushes)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        batch_size: 128
+        dataset:
+          scheduler_mode: adaptive
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # 8. PHASE 3 — dynamic graph / delta exchange / compression. Code deployed via
+  #    deploy_patches.sh + 8/8 unit tests (test_phase3_compression.py). All flag-
+  #    gated: defaults reproduce the base, so these change exactly one factor.
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  - name: dynamic_graph
+    enabled: true
+    description: "Rebuild active push set every 5 windows from ping_aware scores (Phase 12)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset: {scheduler_mode: adaptive}
+        async:
+          communication_policy: dynamic
+          push_fanout: 4
+          dynamic_graph_rebuild_windows: 5
+          dynamic_graph_min_degree: 4
+
+  - name: delta_exchange
+    enabled: true
+    description: "Send weight deltas instead of full weights (Phase 13)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset: {scheduler_mode: adaptive}
+        async: {payload_mode: delta}
+
+  - name: compress_float16
+    enabled: true
+    description: "float16 payloads — ~2x smaller, minimal quality risk (Phase 14)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset: {scheduler_mode: adaptive}
+        async: {compression: float16}
+
+  - name: compress_quant8
+    enabled: true
+    description: "8-bit quantized payloads — ~4x smaller (Phase 14)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset: {scheduler_mode: adaptive}
+        async: {compression: quant8}
+
+  - name: compress_topk
+    enabled: true
+    description: "top-k 10% sparsified payloads — ~10x+ smaller (Phase 14)"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset: {scheduler_mode: adaptive}
+        async: {compression: topk_sparse}
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # DISABLED — single_node_baseline still needs an orchestrate local-train driver.
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  - name: single_node_baseline
+    enabled: false
+    description: "Single node, no gossip — needs orchestrate local-train driver"
+    overlay: none
+    config:
+      training:
+        mode: async
+        dataset:
+          scheduler_mode: static
